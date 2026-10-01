@@ -1,0 +1,1235 @@
+diff --git a/src/components/ProofreaderFlow.tsx b/src/components/ProofreaderFlow.tsx
+index 2757e78..e78b26e 100644
+--- a/src/components/ProofreaderFlow.tsx
++++ b/src/components/ProofreaderFlow.tsx
+@@ -27,16 +27,17 @@ const AppSidebar = dynamic(
+ );
+ 
+ import { ProofreaderResponse, ProofreaderIssue, CustomMark, ProofreaderPageData } from "@/types/proofreader";
+-import { supabase } from "@/lib/supabase";
+ import { locateIssuesInPdf } from "@/lib/pdf-text-locator";
+ 
+-interface HistoryItem {
++interface SavedBook {
+   id: string;
+-  name: string;
+-  date: string;
+-  issuesCount: number;
+-  pagesCount: number;
+-  responseData: ProofreaderResponse;
++  title: string;
++  originalName?: string;
++  pageCount: number;
++  status: "queued" | "processing" | "paused" | "done" | "error";
++  progress?: { done?: number; failed?: number };
++  stats?: { issues?: number };
++  createdAt?: string;
+ }
+ 
+ 
+@@ -48,12 +49,12 @@ export default function ProofreaderFlow() {
+   
+   const [activePdfFilename, setActivePdfFilename] = useState<string | null>(null);
+ 
+-  // Interval Refs for cleanup
++  // Polling is backed by durable MongoDB state; UI correctness does not depend
++  // on an in-memory realtime channel staying connected.
+   const pollIntervalRef = useRef<NodeJS.Timeout | null>(null);
+-  const progressIntervalRef = useRef<NodeJS.Timeout | null>(null);
+ 
+-  // In-memory history list
+-  const [history, setHistory] = useState<HistoryItem[]>([]);
++  const [savedBooks, setSavedBooks] = useState<SavedBook[]>([]);
++  const [savedBooksLoading, setSavedBooksLoading] = useState(true);
+ 
+   const [selectedFile, setSelectedFile] = useState<{
+     name: string;
+@@ -69,6 +70,7 @@ export default function ProofreaderFlow() {
+   useEffect(() => { selectedFileRef.current = selectedFile; }, [selectedFile]);
+ 
+   const [activeJobId, setActiveJobId] = useState<string | null>(null);
++  const [analysisStatus, setAnalysisStatus] = useState<"queued" | "processing" | "paused" | "done" | "error">("queued");
+   const [progress, setProgress] = useState(0);
+   const [totalPages, setTotalPages] = useState(0);
+   const [completedPages, setCompletedPages] = useState(0);
+@@ -83,11 +85,19 @@ export default function ProofreaderFlow() {
+   const [showTerminateConfirm, setShowTerminateConfirm] = useState(false);
+   const [globalError, setGlobalError] = useState<string | null>(null);
+   const [mounted, setMounted] = useState(false);
++  const sessionRestoredRef = useRef(false);
+ 
+   useEffect(() => {
+     setMounted(true);
+   }, []);
+ 
++  useEffect(() => {
++    if (activeJobId) {
++      localStorage.setItem("proofreader_activeJobId", activeJobId);
++      localStorage.setItem("proofreader_stage", stage);
++    }
++  }, [activeJobId, stage]);
++
+ 
+ 
+ 
+@@ -111,23 +121,37 @@ export default function ProofreaderFlow() {
+     });
+   };
+ 
+-  const saveToHistory = (fileName: string, pageCount: number, issueCount: number, data: ProofreaderResponse) => {
+-    const item: HistoryItem = {
+-      id: Math.random().toString(36).substr(2, 9),
+-      name: fileName,
+-      date: new Date().toLocaleString(),
+-      issuesCount: issueCount,
+-      pagesCount: pageCount,
+-      responseData: data,
+-    };
+-    setHistory(prev => [item, ...prev]);
++  const refreshSavedBooks = async () => {
++    try {
++      const response = await fetch("/api/books", { cache: "no-store" });
++      if (response.ok) {
++        const books = await response.json();
++        setSavedBooks(books);
++        
++        // Restore session on reload
++        if (!sessionRestoredRef.current) {
++          sessionRestoredRef.current = true;
++          const savedJobId = localStorage.getItem("proofreader_activeJobId");
++          if (savedJobId) {
++            const bookToRestore = books.find((b: any) => b.id === savedJobId);
++            if (bookToRestore) {
++              openSavedBook(bookToRestore);
++            }
++          }
++        }
++      }
++    } finally {
++      setSavedBooksLoading(false);
++    }
+   };
+ 
+-  // ── Normalize raw n8n issue object → canonical ProofreaderIssue ─────────
++  useEffect(() => { void refreshSavedBooks(); }, []);
++
++  // Normalize persisted backend issue objects into the review UI shape.
+   const normalizeIssue = (issue: any, idx: number) => {
+     const pageNum =
+       issue.page ??             // canonical (1-indexed, may be null)
+-      issue.page_number ??      // n8n raw snake_case
++      issue.page_number ??      // accepted legacy snake_case
+       issue.pageNumber ??       // camelCase variant
+       issue.pageIndex ??        // pageIndex fallback
+       null;
+@@ -137,9 +161,19 @@ export default function ProofreaderFlow() {
+       issue.page ??
+       null;
+ 
++    const severity = issue.severity === "major" ? "high" : issue.severity === "minor" ? "low" : (issue.severity || "medium");
++    const box = issue.box;
++    const bbox = box ? {
++      x: Number(box.xmin || 0) / 10,
++      y: Number(box.ymin || 0) / 10,
++      w: Math.max(0.5, (Number(box.xmax || 1000) - Number(box.xmin || 0)) / 10),
++      h: Math.max(0.5, (Number(box.ymax || 1000) - Number(box.ymin || 0)) / 10),
++    } : issue.bbox;
++
+     return {
+       ...issue,
+       id: idx + 1,
++      backendUid: issue.uid,
+       page: typeof pageNum === "number" ? pageNum : null,
+       pageIndex: typeof pageIdx === "number" ? pageIdx : null,
+       originalText: issue.originalText ?? issue.text ?? issue.original_text ?? "",
+@@ -147,38 +181,103 @@ export default function ProofreaderFlow() {
+       explanation: issue.explanation ?? issue.reason ?? issue.why ?? "",
+       category: issue.category ?? issue.issueCategory ?? "General",
+       type: issue.type ?? issue.issueType ?? issue.subtype ?? "Issue",
+-      severity: issue.severity ?? issue.level ?? "medium",
+-      locationHint: issue.locationHint ?? issue.location ?? "",
++      severity,
++      locationHint: issue.locationHint ?? issue.location ?? (pageNum ? `Page ${pageNum}` : ""),
+       confidence: issue.confidence ?? 1.0,
+-      // bbox is intentionally NOT taken from n8n — the app locates originalText
+-      // inside the PDF text layer for pixel-accurate coordinates (locateIssuesInPdf)
+-      bbox: undefined,
+-      resolved: false,
+-      ignored: false,
++      bbox,
++      resolved: issue.status === "accepted" || issue.status === "fixed" || !!issue.resolved,
++      ignored: issue.status === "dismissed" || !!issue.ignored,
+     };
+   };
+ 
+-  const loadHistoryItem = (item: HistoryItem) => {
+-    setResponseData(item.responseData);
+-
+-    const issuesWithIds = (item.responseData.issues || []).map(normalizeIssue);
+-    setIssues(issuesWithIds);
+-    setSelectedFile({
+-      name: item.name,
+-      subject: "Restored Session",
+-      size: "Restored",
+-      pages: item.pagesCount,
+-      eta: "0s",
+-    });
+-    setTotalPages(item.pagesCount);
+-    setCompletedPages(item.pagesCount);
++  const buildResponse = (book: any, backendPages: any[]): ProofreaderResponse => {
++    const sortedPages = [...backendPages].sort((a, b) => (a.pageNumber || 0) - (b.pageNumber || 0));
++    const normalized = sortedPages.flatMap((page: any) =>
++      (page.issues || []).map((issue: any) => ({ ...issue, page: page.pageNumber, pageIndex: page.pageNumber }))
++    ).map(normalizeIssue);
++    const severityCounts = normalized.reduce((counts, issue) => {
++      counts[issue.severity as keyof typeof counts] += 1;
++      return counts;
++    }, { critical: 0, high: 0, medium: 0, low: 0 });
++    const reviewed = backendPages.filter((page: any) => page.status === "done").length;
++    return {
++      success: book.status === "done",
++      pagesReviewed: reviewed,
++      pagesExpected: book.pageCount,
++      visualReviewPendingCount: backendPages.filter((page: any) => page.status === "error").length,
++      issueCount: normalized.length,
++      printReady: book.status === "done" && normalized.length === 0,
++      severityCounts,
++      issues: normalized,
++      perPage: backendPages,
++    };
++  };
+ 
+-    if (issuesWithIds.length > 0) {
+-      setActiveIssueId(issuesWithIds[0].id);
++  const openSavedBook = async (saved: SavedBook) => {
++    try {
++      setGlobalError(null);
++      const [jobResponse, fileResponse] = await Promise.all([
++        fetch(`/api/books/${encodeURIComponent(saved.id)}`, { cache: "no-store" }),
++        fetch(`/api/books/${encodeURIComponent(saved.id)}/file`, { cache: "no-store" }),
++      ]);
++      const payload = await jobResponse.json();
++      if (!jobResponse.ok) throw new Error(payload.error || "Could not open this proofread");
++      if (!fileResponse.ok) throw new Error("The original PDF is no longer available");
++      const blob = await fileResponse.blob();
++      const rawFile = new File([blob], saved.originalName || `${saved.title}.pdf`, { type: "application/pdf" });
++      const backendPages = payload.pages || [];
++      const data = buildResponse(payload.book, backendPages);
++      const restoredIssues = data.issues;
++
++      setActiveJobId(saved.id);
++      setAnalysisStatus(payload.book.status);
++      setSelectedFile({
++        name: saved.originalName || `${saved.title}.pdf`, subject: saved.title,
++        size: `${(blob.size / 1024 / 1024).toFixed(1)} MB`, pages: saved.pageCount, eta: "0s", rawFile,
++      });
++      setTotalPages(saved.pageCount);
++      setCompletedPages(payload.book.progress?.done || 0);
++      setProgress(saved.pageCount ? Math.round((((payload.book.progress?.done || 0) + (payload.book.progress?.failed || 0)) / saved.pageCount) * 100) : 0);
++      setPages(backendPages.map((page: any) => ({ page_number: page.pageNumber, image_url: page.imageUrl })));
++      setResponseData(data);
++      setIssues(restoredIssues);
++      setActiveIssueId(restoredIssues[0]?.id || null);
++      setSidebarActiveTab("proofreading");
++      
++      const savedStage = localStorage.getItem("proofreader_stage");
++      if (savedStage && ["analysis", "dashboard", "review", "export"].includes(savedStage)) {
++        setStage(savedStage as any);
++      } else {
++        setStage(payload.book.status === "done" ? "dashboard" : "analysis");
++      }
++      
++      if (payload.book.status !== "done" && payload.book.status !== "error") {
++        if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
++        pollIntervalRef.current = setInterval(async () => {
++          try {
++            const response = await fetch(`/api/job?id=${encodeURIComponent(saved.id)}`, { cache: "no-store" });
++            const live = await response.json();
++            if (!response.ok) throw new Error(live.error || "Could not refresh analysis");
++            const done = Number(live.book.progress?.done || 0);
++            const failed = Number(live.book.progress?.failed || 0);
++            setAnalysisStatus(live.book.status);
++            setCompletedPages(done);
++            setProgress(saved.pageCount ? Math.round(((done + failed) / saved.pageCount) * 100) : 0);
++            if (live.book.status === "done" || live.book.status === "error") {
++              if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
++              await refreshSavedBooks();
++              if (live.book.status === "done") await openSavedBook({ ...saved, status: "done" });
++              else setGlobalError(live.book.error || "Analysis failed");
++            }
++          } catch (error: any) {
++            if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
++            setGlobalError(error.message || "Could not refresh analysis");
++          }
++        }, 2000);
++      }
++    } catch (error: any) {
++      setGlobalError(error.message || "Could not reopen this proofread");
+     }
+-
+-    setStage("dashboard");
+-    setSidebarActiveTab("proofreading");
+   };
+ 
+   const startAnalysis = async (scanTypes: string[], classLevel: string, subject: string, language: string, activeDelay: number) => {
+@@ -187,191 +286,113 @@ export default function ProofreaderFlow() {
+     setActiveScanTypes(scanTypes);
+     setStage("analysis");
+     setProgress(0);
+-
+-    // Clear any existing intervals
+     if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
+-    if (progressIntervalRef.current) clearInterval(progressIntervalRef.current);
+-
+-    progressIntervalRef.current = setInterval(() => {
+-      setProgress((prev) => {
+-        if (prev >= 95) return 95;
+-        return prev + 5;
+-      });
+-    }, 1000);
+-
+-    // Mock data response definition
+-    // Trigger scan flow using module-scoped mockData fallback
+-
+-
+-
+-    let pdfFilename = '';
+-
+-    // Yield to the browser so it can render the Analysis (spinner) stage immediately
+-    // before the heavy file upload blocks the thread or network queue.
++    let pdfFilename = "";
+     await new Promise(resolve => setTimeout(resolve, 50));
+ 
+     try {
+-      // 1. Get a secure presigned upload URL from our backend
+-      const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+-      const safeOriginalName = selectedFile.rawFile.name.replace(/[^a-zA-Z0-9.-]/g, '_');
+-      pdfFilename = `${uniqueSuffix}-${safeOriginalName}`;
+-
+-      const urlRes = await fetch('/api/upload-url', {
+-        method: 'POST',
+-        headers: { 'Content-Type': 'application/json' },
+-        body: JSON.stringify({ filename: pdfFilename, contentType: selectedFile.rawFile.type || 'application/pdf' })
++      const urlRes = await fetch("/api/upload-url", {
++        method: "POST",
++        headers: { "Content-Type": "application/json" },
++        body: JSON.stringify({
++          filename: selectedFile.rawFile.name,
++          contentType: selectedFile.rawFile.type || "application/pdf",
++          fileSize: selectedFile.rawFile.size,
++        }),
+       });
++      const uploadTicket = await urlRes.json();
++      if (!urlRes.ok) throw new Error(uploadTicket.error || "Failed to prepare secure upload");
++      pdfFilename = uploadTicket.objectKey;
++      setActivePdfFilename(pdfFilename);
+ 
+-      if (!urlRes.ok) {
+-        throw new Error("Failed to secure AWS upload token");
+-      }
+-
+-      const { presignedUrl, publicUrl } = await urlRes.json();
+-
+-      // 2. Upload file directly to AWS S3, bypassing server size limits
+-      const uploadRes = await fetch(presignedUrl, {
+-        method: 'PUT',
++      const uploadRes = await fetch(uploadTicket.presignedUrl, {
++        method: "PUT",
+         body: selectedFile.rawFile,
+-        headers: {
+-          'Content-Type': selectedFile.rawFile.type || 'application/pdf'
+-        }
++        headers: { "Content-Type": "application/pdf" },
+       });
++      if (!uploadRes.ok) throw new Error(`PDF upload failed: ${uploadRes.statusText}`);
+ 
+-      if (!uploadRes.ok) {
+-        throw new Error(`Failed to upload to AWS S3: ${uploadRes.statusText}`);
+-      }
+-
+-      const pdfUrl = publicUrl;
+-
+-      if (!pdfUrl) {
+-        throw new Error("Failed to get document URL from AWS storage");
+-      }
+-
+-      // 2. Send tiny JSON payload to our unified /api/analyze route
+-      const res = await fetch('/api/analyze', {
++      const res = await fetch("/api/analyze", {
+         method: "POST",
+-        headers: {
+-          "Content-Type": "application/json",
+-        },
++        headers: { "Content-Type": "application/json" },
+         body: JSON.stringify({
+-          pdfUrl,
+           pdfFilename,
++          originalName: selectedFile.rawFile.name,
++          title: selectedFile.rawFile.name.replace(/\.pdf$/i, ""),
+           classLevel,
+           subject,
+-          language,
+-          delaySeconds: activeDelay.toString()
++          language: language.toLowerCase().includes("hindi") ? "hindi" : "english",
++          bookType: "textbook",
++          delaySeconds: activeDelay.toString(),
+         }),
+       });
+-
+-      if (!res.ok) {
+-        const errorText = await res.text();
+-        console.error("API error response:", errorText);
+-        throw new Error(`Failed to start analysis: ${errorText}`);
+-      }
+-
+-      const { jobId, filename } = await res.json();
++      const created = await res.json();
++      if (!res.ok) throw new Error(created.error || "Failed to start analysis");
++      const { jobId, book } = created;
+       setActiveJobId(jobId);
+-      if (filename) setActivePdfFilename(filename);
+-
+-      // 3. Start realtime subscription for job status
+-      const channel = supabase
+-        .channel(`job_${jobId}`)
+-        .on(
+-          'postgres_changes',
+-          {
+-            event: 'UPDATE',
+-            schema: 'public',
+-            table: 'jobs',
+-            filter: `id=eq.${jobId}`,
+-          },
+-          (payload) => {
+-            const jobData = payload.new as any;
+-            if (jobData.status === 'COMPLETED' && jobData.result_data) {
+-              if (progressIntervalRef.current) clearInterval(progressIntervalRef.current);
+-              setProgress(100);
+-
+-              const data: ProofreaderResponse = jobData.result_data;
+-              setResponseData(data);
+-              
+-              const issuesWithIds = (data.issues || []).map(normalizeIssue);
+-              // Phase 1: show issues instantly (no bbox yet — right panel is immediately usable)
+-              setIssues(issuesWithIds);
+-
+-              // Phase 2: find exact text positions in the PDF and update bbox overlays
+-              const rawFile = selectedFileRef.current?.rawFile;
+-              if (rawFile) {
+-                locateIssuesInPdf(rawFile, issuesWithIds).then((located) => {
+-                  setIssues(located as ProofreaderIssue[]);
+-                }).catch((e) => {
+-                  console.warn("[locateIssues] Could not resolve bboxes:", e);
+-                });
+-              }
+-              
+-              setSelectedFile(prev => prev ? { ...prev, pages: data.pagesReviewed } : null);
+-              setTotalPages(data.pagesReviewed);
+-              setCompletedPages(data.pagesReviewed);
+-              
+-              if (issuesWithIds.length > 0) {
+-                setActiveIssueId(issuesWithIds[0].id);
+-              }
+-              
+-              saveToHistory(selectedFile?.name || "document.pdf", data.pagesReviewed, issuesWithIds.length, data);
+-              
+-              // Await the deletion BEFORE changing the stage so the browser doesn't cancel the request
+-              const cleanupAndProceed = async () => {
+-                if (pdfFilename) {
+-                  try {
+-                    const res = await fetch('/api/delete-file', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ filename: pdfFilename }) });
+-                    if (!res.ok) console.error("Auto-delete API Error:", await res.text());
+-                    else console.log(`Successfully deleted ${pdfFilename} from S3.`);
+-                  } catch (e) { console.error("Auto-delete failed:", e); }
+-                }
+-              };
+-
+-              cleanupAndProceed().finally(() => {
+-                setStage("dashboard");
+-              });
+-
+-              // Unsubscribe once completed
+-              supabase.removeChannel(channel);
+-            } else if (jobData.status === 'ERROR') {
+-              if (progressIntervalRef.current) clearInterval(progressIntervalRef.current);
+-              
+-              const cleanupError = async () => {
+-                if (pdfFilename) {
+-                  try {
+-                    await fetch('/api/delete-file', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ filename: pdfFilename }) });
+-                  } catch (e) { console.error("Auto-delete failed:", e); }
+-                }
+-              };
+-
+-              cleanupError().finally(() => {
+-                setGlobalError('The backend encountered a problem. Please try again later or contact support.');
+-                setTimeout(() => setGlobalError(null), 8000);
+-                supabase.removeChannel(channel);
+-              });
+-            }
++      setActivePdfFilename(null);
++      setTotalPages(book.pageCount || 0);
++      void refreshSavedBooks();
++
++      const poll = async () => {
++        const statusRes = await fetch(`/api/job?id=${encodeURIComponent(jobId)}`, { cache: "no-store" });
++        const payload = await statusRes.json();
++        if (!statusRes.ok) throw new Error(payload.error || "Could not read analysis status");
++        const liveBook = payload.book;
++        setAnalysisStatus(liveBook.status);
++        const backendPages = payload.pages || [];
++        const done = Number(liveBook.progress?.done || 0);
++        const failed = Number(liveBook.progress?.failed || 0);
++        const expected = Number(liveBook.pageCount || backendPages.length || 0);
++        setTotalPages(expected);
++        setCompletedPages(done);
++        setProgress(expected ? Math.min(100, Math.round(((done + failed) / expected) * 100)) : 0);
++        setPages(backendPages.map((page: any) => ({
++          page_number: page.pageNumber,
++          image_url: page.imageUrl,
++        })));
++
++        if (liveBook.status === "done") {
++          if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
++          const data = buildResponse(liveBook, backendPages);
++          let normalized = data.issues;
++          const rawFile = selectedFileRef.current?.rawFile;
++          if (rawFile && normalized.some((issue) => !issue.bbox)) {
++            try { normalized = await locateIssuesInPdf(rawFile, normalized) as ProofreaderIssue[]; } catch {}
+           }
+-        )
+-        .subscribe();
++          data.issues = normalized;
++          setResponseData(data);
++          setIssues(normalized);
++          setSelectedFile(prev => prev ? { ...prev, pages: expected } : null);
++          if (normalized.length) setActiveIssueId(normalized[0].id);
++          void refreshSavedBooks();
++          setProgress(100);
++          setStage("dashboard");
++        } else if (liveBook.status === "error") {
++          if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
++          throw new Error(liveBook.error || "Every page failed to analyze");
++        }
++        return liveBook.status as string;
++      };
++
++      const initialStatus = await poll();
++      if (initialStatus !== "done") {
++        pollIntervalRef.current = setInterval(() => {
++          poll().catch((error) => {
++            if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
++            setGlobalError(error.message || "Analysis status could not be refreshed");
++          });
++        }, 2000);
++      }
+ 
+     } catch (err: any) {
+-      console.warn("API target endpoint offline or failed:", err);
+-      
+-      if (progressIntervalRef.current) clearInterval(progressIntervalRef.current);
+       if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
+       setProgress(0);
+       setStage("upload");
+-
+-      // Clean up the uploaded PDF if the webhook call itself failed
+       if (pdfFilename) {
+-        fetch('/api/delete-file', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ filename: pdfFilename }) })
+-          .catch(e => console.warn("Failed to delete orphaned file:", e));
++        fetch("/api/delete-file", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ objectKey: pdfFilename }) }).catch(() => {});
+       }
+-
+-      setGlobalError(err?.message || "Webhook offline or failed. Please check connection.");
+-      setTimeout(() => setGlobalError(null), 5000);
+-      setStage("upload");
++      setGlobalError(err?.message || "Analysis could not be started");
+     }
+   };
+ 
+@@ -810,30 +831,52 @@ export default function ProofreaderFlow() {
+     document.body.removeChild(link);
+   };
+ 
+-  const resetSession = async () => {
+-    if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
+-    if (progressIntervalRef.current) clearInterval(progressIntervalRef.current);
++  const toggleAnalysisPause = async () => {
++    if (!activeJobId) return;
++    const action = analysisStatus === "paused" ? "resume" : "pause";
++    try {
++      const response = await fetch(`/api/books/${encodeURIComponent(activeJobId)}/${action}`, { method: "POST" });
++      const payload = await response.json();
++      if (!response.ok) throw new Error(payload.error || `Could not ${action} analysis`);
++      setAnalysisStatus(payload.book.status);
++    } catch (error: any) {
++      setGlobalError(error.message || "Analysis control failed");
++    }
++  };
+ 
+-    // Unsubscribe from all realtime channels
+-    supabase.removeAllChannels();
++  const updateIssueStatus = async (issue: ProofreaderIssue, status: "accepted" | "dismissed") => {
++    if (!activeJobId || !issue.backendUid || issue.page == null) return;
++    const response = await fetch(
++      `/api/books/${encodeURIComponent(activeJobId)}/pages/${issue.page}/issues/${encodeURIComponent(issue.backendUid)}`,
++      { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ status }) }
++    );
++    if (!response.ok) {
++      const payload = await response.json().catch(() => ({}));
++      throw new Error(payload.error || "Could not save review decision");
++    }
++  };
+ 
+-    // Abort active job in Supabase database
+-    if (activeJobId) {
++  useEffect(() => {
++    setResponseData((current) => current ? { ...current, issues } : current);
++  }, [issues]);
++
++  const resetSession = async () => {
++    localStorage.removeItem("proofreader_activeJobId");
++    localStorage.removeItem("proofreader_stage");
++    if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
++    if (activeJobId && ["queued", "processing", "paused", "error"].includes(analysisStatus)) {
+       try {
+-        await supabase
+-          .from("jobs")
+-          .update({ status: "CANCELLED" })
+-          .eq("id", activeJobId);
++        await fetch(`/api/books/${encodeURIComponent(activeJobId)}`, { method: "DELETE" });
+       } catch (err) {
+-        console.warn("Failed to abort job in database:", err);
++        console.warn("Failed to remove proofread:", err);
+       }
+-      setActiveJobId(null);
+     }
++    setActiveJobId(null);
+ 
+     // Delete temporary file from S3 storage
+     if (activePdfFilename) {
+       try {
+-        await fetch('/api/delete-file', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ filename: activePdfFilename }) });
++        await fetch('/api/delete-file', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ objectKey: activePdfFilename }) });
+       } catch (err) {
+         console.warn("Failed to delete temporary file:", err);
+       }
+@@ -842,6 +885,7 @@ export default function ProofreaderFlow() {
+ 
+     setSelectedFile(null);
+     setProgress(0);
++    setAnalysisStatus("queued");
+     setResponseData(null);
+     setPages([]);
+     setIssues([]);
+@@ -849,13 +893,14 @@ export default function ProofreaderFlow() {
+     setCurrentPage(1);
+     setActiveIssueId(null);
+     setStage("upload");
++    void refreshSavedBooks();
+   };
+ 
+   const resolvedCount = issues.filter((i) => i.resolved || i.ignored).length + customMarks.length;
+   const totalCount = issues.length + customMarks.length;
+ 
+   return (
+-    <div className="flex h-screen w-full bg-[#F8FAFC] text-slate-900 overflow-hidden font-sans selection:bg-brand-500/20 selection:text-brand-700">
++    <div className="flex h-screen w-full relative bg-[#F8FAFC] text-slate-900 overflow-hidden font-sans selection:bg-brand-500/20 selection:text-brand-700">
+       
+       <AppSidebar
+         stage={stage}
+@@ -919,12 +964,14 @@ export default function ProofreaderFlow() {
+                   ].map((step, idx) => {
+                     const isCompleted = idx < stageOrder.indexOf(stage);
+                     const isActive = stage === step.key;
++                    const isAvailable = step.key === "upload" || (step.key === "analysis" ? !!activeJobId : !!responseData);
+ 
+                     return (
+                       <React.Fragment key={step.key}>
+                         <button
+-                          onClick={() => setStage(step.key as any)}
+-                          className="flex-1 flex items-center justify-center gap-2 py-2 px-3 rounded-xl relative z-10 focus:outline-none group transition-colors duration-200"
++                          onClick={() => isAvailable && setStage(step.key as any)}
++                          disabled={!isAvailable}
++                          className="flex-1 flex items-center justify-center gap-2 py-2 px-3 rounded-xl relative z-10 focus:outline-none group transition-colors duration-200 disabled:cursor-not-allowed disabled:opacity-60"
+                         >
+                           {/* Animated active pill */}
+                           {isActive && (
+@@ -976,7 +1023,10 @@ export default function ProofreaderFlow() {
+                       transition={{ duration: 0.2 }}
+                       className="flex-1 min-h-0 flex flex-col overflow-hidden"
+                     >
+-                      <UploadStage selectedFile={selectedFile} onFileSelect={handleFileSelect} onStartAnalysis={startAnalysis} />
++                      <UploadStage
++                        selectedFile={selectedFile} onFileSelect={handleFileSelect} onStartAnalysis={startAnalysis}
++                        savedBooks={savedBooks} savedBooksLoading={savedBooksLoading} onOpenSaved={openSavedBook}
++                      />
+                     </motion.div>
+                   )}
+ 
+@@ -990,6 +1040,7 @@ export default function ProofreaderFlow() {
+                       <AnalysisStage
+                         progress={progress} totalPages={totalPages} completedPages={completedPages}
+                         fileName={selectedFile?.name} fileSize={selectedFile?.size} selectedScanTypes={activeScanTypes}
++                        status={analysisStatus} onPauseToggle={toggleAnalysisPause}
+                         onCancel={resetSession} onViewReport={() => setStage("dashboard")}
+                       />
+                     </motion.div>
+@@ -1022,6 +1073,7 @@ export default function ProofreaderFlow() {
+                         issues={issues} setIssues={setIssues} customMarks={customMarks} setCustomMarks={setCustomMarks}
+                         currentPage={currentPage} setCurrentPage={setCurrentPage} activeIssueId={activeIssueId}
+                         setActiveIssueId={setActiveIssueId} pages={pages} onNext={() => setStage("export")}
++                        onIssueStatus={updateIssueStatus}
+                       />
+                     </motion.div>
+                   )}
+@@ -1109,7 +1161,9 @@ export default function ProofreaderFlow() {
+             </div>
+             <h3 className="text-xl font-bold text-slate-900 mb-2">End Session?</h3>
+             <p className="text-slate-500 text-sm mb-8 leading-relaxed font-medium">
+-              All unsaved annotations in the current active memory will be lost. This cannot be undone.
++              {analysisStatus === "done"
++                ? "This closes the current view. The completed proofread and review decisions stay saved in Recent proofreads."
++                : "This aborts the active analysis and removes its temporary job data. This cannot be undone."}
+             </p>
+             <div className="flex gap-3">
+               <button
+diff --git a/src/components/stages/ReviewStage.tsx b/src/components/stages/ReviewStage.tsx
+index c94d49e..b719fc3 100644
+--- a/src/components/stages/ReviewStage.tsx
++++ b/src/components/stages/ReviewStage.tsx
+@@ -1,6 +1,6 @@
+ "use client";
+ 
+-import React, { useState, useRef } from "react";
++import React, { useEffect, useState, useRef } from "react";
+ import {
+   ZoomIn,
+   ZoomOut,
+@@ -20,16 +20,19 @@ import {
+   X,
+   AlertTriangle,
+   ArrowRight,
+-  CheckCircle2
++  CheckCircle2,
++  ListPlus
+ } from "lucide-react";
+ import { ProofreaderIssue, CustomMark, ProofreaderPageData } from "@/types/proofreader";
++import IssueList from "./IssueList";
++import LeaderLine from "./LeaderLine";
+ 
+ import { Document, Page, pdfjs } from "react-pdf";
+-import "react-pdf/dist/Page/TextLayer.css";
++import "react-pdf/dist/esm/Page/TextLayer.css";
+ 
+ // Configure PDFjs worker for client-side parsing
+ if (typeof window !== "undefined") {
+-  pdfjs.GlobalWorkerOptions.workerSrc = `https://unpkg.com/pdfjs-dist@${pdfjs.version}/build/pdf.worker.min.mjs`;
++  pdfjs.GlobalWorkerOptions.workerSrc = `https://unpkg.com/pdfjs-dist@${pdfjs.version}/build/pdf.worker.min.js`;
+ }
+ 
+ interface ReviewStageProps {
+@@ -50,6 +53,7 @@ interface ReviewStageProps {
+   activeIssueId: number | null;
+   setActiveIssueId: (id: number | null) => void;
+   pages?: ProofreaderPageData[];
++  onIssueStatus?: (issue: ProofreaderIssue, status: "accepted" | "dismissed") => Promise<void>;
+   onNext: () => void;
+ }
+ 
+@@ -64,11 +68,13 @@ export function ReviewStage({
+   activeIssueId,
+   setActiveIssueId,
+   pages = [],
++  onIssueStatus,
+   onNext,
+ }: ReviewStageProps) {
+   const [activeTool, setActiveTool] = useState<"circle" | "square" | "select">("select");
+   const [zoomLevel, setZoomLevel] = useState<number>(100);
+   const [activeRightTab, setActiveRightTab] = useState<"automated" | "manual">("automated");
++  const [activeMarkId, setActiveMarkId] = useState<string | null>(null);
+ 
+   // Wikipedia Search
+   const [onlineSearchQuery, setOnlineSearchQuery] = useState("");
+@@ -85,6 +91,8 @@ export function ReviewStage({
+   // exactly with the rendered page content (instead of the old hardcoded 812px
+   // which caused ±4 px drift on A4 pages).
+   const [pageDims, setPageDims] = useState<{ w: number; h: number } | null>(null);
++  const [numPages, setNumPages] = useState<number | null>(null);
++  const totalPages = numPages || (pages.length > 0 ? pages.length : selectedFile?.pages || 1);
+   const CANVAS_WIDTH = 580;
+   const containerHeight = pageDims
+     ? Math.round((pageDims.h / pageDims.w) * CANVAS_WIDTH)
+@@ -94,6 +102,15 @@ export function ReviewStage({
+   const [pendingSelection, setPendingSelection] = useState<{ x: number; y: number; w: number; h: number } | null>(null);
+   const [newCommentText, setNewCommentText] = useState("");
+ 
++  const rootRef = useRef<HTMLDivElement>(null);
++  const cardRefs = useRef<Record<number, HTMLElement | null>>({});
++  const issueBoxRefs = useRef<Record<number, HTMLElement | null>>({});
++  const markBoxRefs = useRef<Record<string, HTMLElement | null>>({});
++  const markCardRefs = useRef<Record<string, HTMLElement | null>>({});
++
++  // We need the root ref on the main container
++  const mainContainerRef = useRef<HTMLDivElement>(null);
++
+   const pageContainerRef = useRef<HTMLDivElement>(null);
+   const activeIssue = issues.find((i) => i.id === activeIssueId);
+ 
+@@ -198,18 +215,34 @@ export function ReviewStage({
+     setCustomMarks((prev) => prev.filter((m) => m.id !== id));
+   };
+ 
+-  const handleResolve = (issueId: number) => {
++  const handleResolve = async (issueId: number) => {
++    const issue = issues.find((item) => item.id === issueId);
++    if (!issue) return;
+     setIssues((prev) =>
+       prev.map((i) => (i.id === issueId ? { ...i, resolved: true } : i))
+     );
+-    goToNextIssue(issueId);
++    try {
++      await onIssueStatus?.(issue, "accepted");
++      goToNextIssue(issueId);
++    } catch (error: any) {
++      setIssues((prev) => prev.map((i) => (i.id === issueId ? { ...i, resolved: false } : i)));
++      window.alert(error.message || "Could not save this review decision");
++    }
+   };
+ 
+-  const handleIgnore = (issueId: number) => {
++  const handleIgnore = async (issueId: number) => {
++    const issue = issues.find((item) => item.id === issueId);
++    if (!issue) return;
+     setIssues((prev) =>
+       prev.map((i) => (i.id === issueId ? { ...i, ignored: true } : i))
+     );
+-    goToNextIssue(issueId);
++    try {
++      await onIssueStatus?.(issue, "dismissed");
++      goToNextIssue(issueId);
++    } catch (error: any) {
++      setIssues((prev) => prev.map((i) => (i.id === issueId ? { ...i, ignored: false } : i)));
++      window.alert(error.message || "Could not save this review decision");
++    }
+   };
+ 
+   const goToNextIssue = (currentId: number) => {
+@@ -221,9 +254,6 @@ export function ReviewStage({
+         const nextPage = nextIssue.page ?? nextIssue.pageIndex;
+         if (nextPage && nextPage !== currentPage) {
+           setCurrentPage(nextPage);
+-          setTimeout(() => scrollToIssueBox(nextIssue.id), 400);
+-        } else {
+-          scrollToIssueBox(nextIssue.id);
+         }
+         return;
+       }
+@@ -231,21 +261,47 @@ export function ReviewStage({
+     setActiveIssueId(null);
+   };
+ 
+-  /** Scroll only the PDF canvas viewport to center the issue box — never scrolls the outer layout. */
+-  const scrollToIssueBox = (issueId: number) => {
+-    const el = document.getElementById(`issue-box-${issueId}`);
+-    if (!el) return;
+-    const scrollParent = el.closest('.overflow-auto') as HTMLElement | null;
+-    if (!scrollParent) return;
+-    const elRect = el.getBoundingClientRect();
+-    const parentRect = scrollParent.getBoundingClientRect();
+-    scrollParent.scrollTo({
+-      top: scrollParent.scrollTop + elRect.top - parentRect.top - parentRect.height / 2 + elRect.height / 2,
+-      behavior: 'smooth'
+-    });
+-  };
++  useEffect(() => {
++    const onKeyDown = (event: KeyboardEvent) => {
++      const target = event.target as HTMLElement | null;
++      if (target?.matches("input, textarea, select, [contenteditable='true']")) return;
++      if (event.key === "ArrowLeft") setCurrentPage(Math.max(1, currentPage - 1));
++      if (event.key === "ArrowRight") setCurrentPage(Math.min(totalPages, currentPage + 1));
++      if ((event.key === "a" || event.key === "A") && activeIssueId) void handleResolve(activeIssueId);
++      if ((event.key === "x" || event.key === "X") && activeIssueId) void handleIgnore(activeIssueId);
++      if (event.key === "j" || event.key === "k") {
++        const index = issues.findIndex((item) => item.id === activeIssueId);
++        const nextIndex = event.key === "j" ? Math.min(issues.length - 1, index + 1) : Math.max(0, index - 1);
++        const next = issues[nextIndex];
++        if (next) {
++          setActiveIssueId(next.id);
++          const nextPage = next.page ?? next.pageIndex;
++          if (nextPage) setCurrentPage(nextPage);
++        }
++      }
++    };
++    window.addEventListener("keydown", onKeyDown);
++    return () => window.removeEventListener("keydown", onKeyDown);
++  // Handlers intentionally refresh with the current review state on each change.
++  // eslint-disable-next-line react-hooks/exhaustive-deps
++  }, [activeIssueId, currentPage, issues, totalPages]);
++
++  useEffect(() => {
++    if (!activeIssueId) return;
++    const timer = setTimeout(() => {
++      const card = cardRefs.current[activeIssueId];
++      if (card) {
++        card.scrollIntoView({ behavior: "smooth", block: "center" });
++      }
++      
++      const pin = issueBoxRefs.current[activeIssueId];
++      if (pin) {
++        pin.scrollIntoView({ behavior: "smooth", block: "nearest", inline: "center" });
++      }
++    }, 50);
++    return () => clearTimeout(timer);
++  }, [activeIssueId, currentPage]);
+ 
+-  const [numPages, setNumPages] = useState<number | null>(null);
+   const [fileUrl, setFileUrl] = useState<string | null>(null);
+   
+   React.useEffect(() => {
+@@ -260,66 +316,41 @@ export function ReviewStage({
+     }
+   }, [selectedFile]);
+ 
+-  // Dynamic text highlighting within the PDF text layer
+-  React.useEffect(() => {
+-    if (!activeIssue || (activeIssue.page ?? activeIssue.pageIndex) !== currentPage || activeIssue.resolved || activeIssue.ignored) {
+-      return;
+-    }
+-
+-    const textToFind = activeIssue.originalText?.trim();
+-    if (!textToFind || textToFind.length < 3) return;
+-
+-    // Small timeout to ensure the PDF text layer DOM is fully rendered
+-    const timer = setTimeout(() => {
+-      const textLayer = pageContainerRef.current?.querySelector(".react-pdf__Page__textLayer");
+-      if (!textLayer) return;
+-
+-      // Clean up previous custom highlights
+-      const prevHighlights = textLayer.querySelectorAll("mark.ai-highlight");
+-      prevHighlights.forEach((el) => {
+-        const textNode = document.createTextNode(el.textContent || "");
+-        el.parentNode?.replaceChild(textNode, el);
+-      });
+-      textLayer.normalize();
+-
+-      const spans = Array.from(textLayer.querySelectorAll("span"));
+-      spans.forEach((span) => {
+-        const text = span.textContent || "";
+-        if (text.toLowerCase().includes(textToFind.toLowerCase())) {
+-          const index = text.toLowerCase().indexOf(textToFind.toLowerCase());
+-          const before = text.substring(0, index);
+-          const match = text.substring(index, index + textToFind.length);
+-          const after = text.substring(index + textToFind.length);
+-
+-          // Escape user-controlled content to prevent XSS via innerHTML
+-          const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+-          const titleAttr = esc(`${activeIssue.type}: ${activeIssue.explanation}`);
+-
+-          span.innerHTML = `${esc(before)}<mark class="ai-highlight bg-yellow-200/80 border-b-2 border-amber-500 text-slate-900 rounded px-0.5 cursor-help" style="background-color: rgba(254, 240, 138, 0.8);" title="${titleAttr}">${esc(match)}</mark>${esc(after)}`;
+-        }
+-      });
+-    }, 350);
+-
+-    return () => clearTimeout(timer);
+-  }, [activeIssue, currentPage, fileUrl]);
+-
+   const onDocumentLoadSuccess = ({ numPages }: { numPages: number }) => {
+     setNumPages(numPages);
+   };
+ 
+-  const totalPages = numPages || (pages.length > 0 ? pages.length : 1);
+   const pageNumbers = Array.from({ length: totalPages }, (_, i) => i + 1);
+ 
+   return (
+-    <div className="flex h-full w-full relative z-10 font-sans bg-white flex-grow overflow-hidden min-h-0 rounded-2xl border border-slate-200/80 shadow-[0_4px_24px_rgba(0,0,0,0.04)]">
++    <div ref={mainContainerRef} className="flex h-full w-full relative z-10 font-sans bg-white flex-grow overflow-hidden min-h-0 rounded-2xl border border-slate-200/80 shadow-[0_4px_24px_rgba(0,0,0,0.04)]">
+       
++      {/* Leader Line for Active Issue */}
++      {activeIssueId && activeRightTab === "automated" && (
++        <LeaderLine
++          rootRef={mainContainerRef}
++          fromElement={issueBoxRefs.current[activeIssueId]}
++          toElement={cardRefs.current[activeIssueId]}
++          color="#4f46e5" // Indigo color to match design
++        />
++      )}
++      
++      {/* Leader Line for Active Manual Mark */}
++      {activeMarkId && activeRightTab === "manual" && (
++        <LeaderLine
++          rootRef={mainContainerRef}
++          fromElement={markBoxRefs.current[activeMarkId]}
++          toElement={markCardRefs.current[activeMarkId]}
++          color="#4f46e5"
++        />
++      )}
+       {/* Left Column removed statically. PDF previews now render in the main sidebar. */}
+ 
+       {/* Center PDF Canvas Viewport */}
+-      <div className="flex-1 bg-slate-100/40 flex flex-col overflow-hidden relative border-r border-slate-200/60">
++      <div className="flex-1 bg-slate-100/40 flex flex-col overflow-hidden relative border-r border-slate-200/60 z-0">
+         
+         {/* PDF Toolbar — Seamless Top Strip */}
+-        <div className="bg-white border-b border-slate-200/80 px-4 flex justify-between items-center shrink-0 z-10 h-12">
++        <div className="bg-white border-b border-slate-200/80 px-4 flex justify-between items-center shrink-0 relative z-30 h-12 shadow-sm">
+           <div className="flex items-center gap-2.5">
+             <span className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Annotations:</span>
+             <div className="flex bg-slate-100/80 p-0.5 rounded-lg border border-slate-200/70 gap-0.5">
+@@ -500,16 +531,18 @@ export function ReviewStage({
+                 <div
+                   id={`issue-box-${issue.id}`}
+                   key={issue.id}
++                  ref={(el) => {
++                    issueBoxRefs.current[issue.id] = el;
++                  }}
+                   onClick={() => {
+                     setActiveRightTab("automated");
+                     setActiveIssueId(issue.id);
+-                    setTimeout(() => scrollToIssueBox(issue.id), 50);
+                   }}
+                   className={`absolute z-10 cursor-pointer transition-all duration-200 ${
+                     isResolved
+                       ? "border-2 border-emerald-500 bg-emerald-50/20"
+                       : isActive
+-                      ? "border-2 border-brand-500 bg-brand-50/20 animate-pulse"
++                      ? "border-2 border-brand-500 bg-brand-50/20"
+                       : "border border-red-400 bg-red-50/10 hover:border-red-500 hover:bg-red-50/25"
+                   }`}
+                   style={{
+@@ -520,11 +553,6 @@ export function ReviewStage({
+                   }}
+                   title={`[${issue.id}] ${issue.category}: ${issue.originalText}`}
+                 >
+-                  <span className={`absolute -top-3 -right-3 h-6 min-w-[24px] px-1.5 rounded-md border flex items-center justify-center text-[10px] font-black shadow-lg backdrop-blur-md transition-transform hover:scale-110 ${
+-                    isResolved ? "bg-emerald-600 text-white border-emerald-500" : isActive ? "bg-brand-600 text-white border-brand-500" : "bg-red-500 text-white border-red-600"
+-                  }`}>
+-                    A{issue.id}
+-                  </span>
+                 </div>
+               );
+             })}
+@@ -548,7 +576,16 @@ export function ReviewStage({
+               return (
+                 <div
+                   key={mark.id}
+-                  className={`absolute ${
++                  ref={(el) => {
++                    markBoxRefs.current[mark.id] = el;
++                  }}
++                  onClick={() => {
++                    setActiveRightTab("manual");
++                    setActiveMarkId(mark.id);
++                  }}
++                  className={`absolute cursor-pointer ${
++                    activeMarkId === mark.id ? "ring-2 ring-brand-500 z-30 " : ""
++                  }${
+                     mark.type === "circle" 
+                       ? "border-[2.5px] border-brand-500 bg-brand-500/10 rounded-full shadow-[0_0_15px_rgba(14,165,233,0.3)]" 
+                       : mark.type === "highlight"
+@@ -613,7 +650,7 @@ export function ReviewStage({
+       </div>
+ 
+       {/* Right Column: AI Resolution Panel */}
+-      <div className="w-80 bg-white border-l border-slate-200/60 flex flex-col h-full shrink-0 shadow-[-4px_0_24px_rgba(0,0,0,0.02)] z-30">
++      <div className="w-80 bg-white border-l border-slate-200/60 flex flex-col h-full shrink-0 shadow-[-4px_0_24px_rgba(0,0,0,0.02)] relative z-30">
+         
+         {/* Sidebar tabs */}
+         {/* Sidebar Header Tabs — Matching Top Strip */}
+@@ -624,7 +661,7 @@ export function ReviewStage({
+               activeRightTab === "automated" ? "border-b-brand-500 text-brand-700 bg-white font-black" : "border-b-transparent hover:bg-slate-50 text-slate-500"
+             }`}
+           >
+-            Automated Checks ({issues.filter(i => !i.resolved && !i.ignored).length})
++            Automated Checks ({issues.filter(i => (i.page ?? i.pageIndex) === currentPage && !i.resolved && !i.ignored).length})
+           </button>
+           <button
+             onClick={() => setActiveRightTab("manual")}
+@@ -632,7 +669,7 @@ export function ReviewStage({
+               activeRightTab === "manual" ? "border-b-brand-500 text-brand-700 bg-white font-black" : "border-b-transparent hover:bg-slate-50 text-slate-500"
+             }`}
+           >
+-            Manual Marks ({customMarks.length})
++            Manual Marks ({customMarks.filter(m => m.page === currentPage).length})
+           </button>
+         </div>
+ 
+@@ -696,129 +733,26 @@ export function ReviewStage({
+             </div>
+ 
+             {/* Automated Issues Queue */}
+-            <div className="flex-1 overflow-y-auto p-4 space-y-3 min-h-0 custom-scrollbar">
+-              <span className="text-[9px] text-slate-400 font-bold uppercase tracking-wider block">Diagnostics</span>
+-              {issues.length === 0 ? (
+-                <div className="flex flex-col items-center justify-center py-12 text-slate-400 text-center gap-3 bg-slate-50/50 rounded-xl border border-slate-100 mt-2">
+-                  <div className="p-2.5 bg-emerald-50 text-emerald-600 rounded-full border border-emerald-100 shadow-sm">
+-                    <CheckCircle2 className="h-5 w-5" />
+-                  </div>
+-                  <div>
+-                    <p className="font-bold text-slate-800 text-xs">No Issues Found</p>
+-                    <p className="text-[10.5px] text-slate-400 max-w-[200px] mx-auto mt-0.5 leading-normal font-medium">
+-                      Your document has passed all automated pedagogical and syntax audits.
+-                    </p>
+-                  </div>
+-                </div>
+-              ) : (
+-                issues.map((issue) => (
+-                  <div
+-                    key={issue.id}
+-                    onClick={() => {
+-                      setActiveIssueId(issue.id);
+-                      const issuePage = issue.page ?? issue.pageIndex;
+-                      if (issuePage !== currentPage && issuePage) {
+-                        setCurrentPage(issuePage);
+-                        setTimeout(() => scrollToIssueBox(issue.id), 400);
+-                      } else {
+-                        scrollToIssueBox(issue.id);
+-                      }
+-                    }}
+-                    className={`p-3.5 border text-xs cursor-pointer transition-all duration-300 rounded-lg transform ${
+-                      issue.id === activeIssueId 
+-                        ? "bg-brand-50/40 border-brand-300 shadow-md shadow-orange-500/20 -translate-y-1" 
+-                        : "bg-white border-slate-200 hover:border-brand-200 hover:shadow-md hover:shadow-orange-500/20 hover:-translate-y-1"
+-                    } ${issue.resolved || issue.ignored ? "opacity-40 hover:-translate-y-0 hover:shadow-none" : ""}`}
+-                  >
+-                    <div className="flex justify-between items-center mb-1.5 text-[8px] font-bold">
+-                      <div className="flex items-center gap-2">
+-                        <span className={`h-4 min-w-[16px] px-1 rounded-sm flex items-center justify-center text-[8px] font-black text-white ${
+-                          issue.severity === "critical" || issue.severity === "high" ? "bg-red-500" : issue.severity === "medium" ? "bg-amber-500" : "bg-blue-500"
+-                        }`}>
+-                          A{issue.id}
+-                        </span>
+-                        <span className={
+-                          issue.severity === "critical" || issue.severity === "high" 
+-                            ? "text-red-600 font-semibold" 
+-                            : issue.severity === "medium" ? "text-amber-600 font-semibold" : "text-blue-600 font-semibold"
+-                        }>
+-                          {issue.category}
+-                        </span>
+-                        <span className="text-[8px] text-slate-400 bg-slate-100 px-1.5 py-0.5 rounded-sm tracking-wider">
+-                          PG {issue.page ?? issue.pageIndex}
+-                        </span>
+-                      </div>
+-                      {issue.resolved && <span className="text-emerald-600 font-mono">RESOLVED</span>}
+-                    </div>
+-                    <p className="font-bold text-slate-900 text-xs mt-1.5">{issue.type}</p>
+-
+-                    {issue.id === activeIssueId && !issue.resolved && !issue.ignored ? (
+-                      <div className="space-y-2.5 mt-3 pt-2.5 border-t border-slate-100 animate-in fade-in duration-150">
+-                        
+-                        {/* Original Flagged Text */}
+-                        {issue.originalText && (
+-                          <div className="p-3 bg-red-50/40 border border-red-200/70 rounded-xl relative overflow-hidden">
+-                            <div className="absolute top-0 left-0 w-1 h-full bg-red-500" />
+-                            <div className="flex items-center gap-1.5 text-[9px] font-bold text-red-700 uppercase tracking-wider mb-1">
+-                              <AlertTriangle className="h-3.5 w-3.5 text-red-600" />
+-                              <span>Original Flag</span>
+-                            </div>
+-                            <p className="text-slate-700 font-mono line-through text-[11px] leading-relaxed">
+-                              "{issue.originalText}"
+-                            </p>
+-                          </div>
+-                        )}
+-
+-                        {/* Combined Suggestion & Reason (What to change & why) */}
+-                        <div className="p-3 bg-emerald-50/40 border border-emerald-200/80 rounded-xl relative overflow-hidden">
+-                          <div className="absolute top-0 left-0 w-1 h-full bg-emerald-500" />
+-                          <div className="flex items-center gap-1.5 text-[9px] font-bold text-emerald-700 uppercase tracking-wider mb-1">
+-                            <Check className="h-3.5 w-3.5 text-emerald-600" />
+-                            <span>Suggested Fix</span>
+-                          </div>
+-                          <p className="text-slate-900 font-bold font-mono text-[11px] leading-relaxed">
+-                            "{issue.suggestedText}"
+-                          </p>
+-                          {issue.explanation && (
+-                            <p className="text-emerald-900/80 text-[10.5px] mt-2 pt-1.5 border-t border-emerald-200/60 leading-relaxed font-medium">
+-                              <span className="font-bold text-emerald-800">Why: </span>
+-                              {issue.explanation}
+-                            </p>
+-                          )}
+-                        </div>
+-
+-                        {/* Action CTAs */}
+-                        <div className="flex gap-2 pt-1">
+-                          <button
+-                            onClick={(e) => {
+-                              e.stopPropagation();
+-                              handleResolve(issue.id);
+-                            }}
+-                            className="bg-emerald-600 hover:bg-emerald-700 text-white px-3 py-2 text-xs font-bold flex-1 flex items-center justify-center gap-1.5 rounded-lg transition-all shadow-xs active:scale-[0.98]"
+-                          >
+-                            <Check className="h-3.5 w-3.5" />
+-                            <span>Apply Fix</span>
+-                          </button>
+-                          <button
+-                            onClick={(e) => {
+-                              e.stopPropagation();
+-                              handleIgnore(issue.id);
+-                            }}
+-                            className="border border-slate-200/90 text-slate-700 px-3 py-2 text-xs font-bold flex-1 bg-white hover:bg-slate-50 rounded-lg transition-all active:scale-[0.98]"
+-                          >
+-                            Ignore
+-                          </button>
+-                        </div>
+-
+-                      </div>
+-                    ) : (
+-                      <p className="text-[10.5px] text-slate-500 leading-normal truncate mt-1">
+-                        "{issue.originalText || issue.suggestedText}"
+-                      </p>
+-                    )}
+-                  </div>
+-                ))
+-              )}
++            <div className="flex-1 overflow-y-auto min-h-0 custom-scrollbar">
++              <IssueList 
++                issues={issues.filter(i => (i.page ?? i.pageIndex) === currentPage)}
++                selectedId={activeIssueId}
++                onSelect={(id) => {
++                  setActiveIssueId(id);
++                  const issue = issues.find(i => i.id === id);
++                  const issuePage = issue?.page ?? issue?.pageIndex;
++                  if (issuePage && issuePage !== currentPage) {
++                    setCurrentPage(issuePage);
++                  }
++                }}
++                onStatus={(id, status) => {
++                  const issue = issues.find(i => i.id === id);
++                  if (issue && onIssueStatus) {
++                    onIssueStatus(issue, status === "open" ? "open" as any : status);
++                  }
++                }}
++                cardRefs={cardRefs}
++              />
+             </div>
+ 
+           </div>
+@@ -832,8 +766,14 @@ export function ReviewStage({
+               {customMarks.map((mark, idx) => (
+                 <div
+                   key={mark.id}
+-                  onClick={() => setCurrentPage(mark.page)}
+-                  className={`relative p-4 bg-white border border-slate-200/80 flex flex-col gap-2 rounded-xl shadow-sm cursor-pointer hover:shadow-md hover:shadow-orange-500/20 hover:border-brand-200 transition-all duration-300 transform hover:-translate-y-1 group overflow-hidden`}
++                  ref={(el) => {
++                    markCardRefs.current[mark.id] = el;
++                  }}
++                  onClick={() => {
++                    setCurrentPage(mark.page);
++                    setActiveMarkId(mark.id);
++                  }}
++                  className={`relative p-4 bg-white border ${activeMarkId === mark.id ? 'border-brand-500 shadow-md ring-1 ring-brand-500/30' : 'border-slate-200/80 hover:shadow-md hover:shadow-orange-500/20 hover:border-brand-200'} flex flex-col gap-2 rounded-xl shadow-sm cursor-pointer transition-all duration-300 transform hover:-translate-y-1 group overflow-hidden`}
+                 >
+                   <div className={`absolute top-0 left-0 w-1 h-full ${
+                     mark.type === "circle" ? "bg-brand-500" : mark.type === "highlight" ? "bg-yellow-400" : "bg-purple-500"
+diff --git a/src/components/system/AppSidebar.tsx b/src/components/system/AppSidebar.tsx
+index 52fa6ee..ca30258 100644
+--- a/src/components/system/AppSidebar.tsx
++++ b/src/components/system/AppSidebar.tsx
+@@ -90,7 +90,7 @@ export function AppSidebar({
+ 
+       {/* 2. Collapsible Pages Preview Drawer */}
+       <div
+-        className={`h-full bg-white border-r border-slate-200/60 transition-all duration-300 ease-in-out flex flex-col overflow-hidden z-40 shrink-0 ${
++        className={`absolute left-16 top-0 bottom-0 bg-white border-r border-slate-200/60 transition-all duration-300 ease-in-out flex flex-col overflow-hidden z-40 shrink-0 shadow-2xl ${
+           isSidebarExpanded && sidebarActiveTab === "preview"
+             ? "w-64 opacity-100"
+             : "w-0 opacity-0 pointer-events-none"

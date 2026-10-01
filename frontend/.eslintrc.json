@@ -1,0 +1,16 @@
+{
+  "extends": ["next/core-web-vitals"],
+  "overrides": [
+    {
+      "files": ["src/server/**/*.js"],
+      "parser": "espree",
+      "parserOptions": {
+        "ecmaVersion": "latest",
+        "sourceType": "module"
+      },
+      "env": {
+        "node": true
+      }
+    }
+  ]
+}

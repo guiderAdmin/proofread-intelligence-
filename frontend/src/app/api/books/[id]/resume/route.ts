@@ -1,0 +1,18 @@
+import { NextResponse } from "next/server";
+import { connectDb } from "@/server/db.js";
+import { assertSameOrigin, apiError, HttpError } from "@/server/http.js";
+import { resumeBook, serializeBook } from "@/server/services/queue.js";
+
+export const runtime = "nodejs";
+
+export async function POST(request: Request, { params }: { params: { id: string } }) {
+  try {
+    assertSameOrigin(request);
+    await connectDb();
+    const book = await resumeBook(params.id);
+    if (!book) throw new HttpError(404, "Proofread not found");
+    return NextResponse.json({ book: serializeBook(book) });
+  } catch (error) {
+    return apiError(error, "Unable to resume analysis");
+  }
+}
