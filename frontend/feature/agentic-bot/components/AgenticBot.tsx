@@ -1,6 +1,7 @@
 "use client";
 
-import React, { useEffect, useRef, useState } from "react";
+import React, { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { Bot, Camera, ChevronDown, GripHorizontal, Loader2, MessageCircle, MousePointer2, Send, Trash2, X } from "lucide-react";
 
 type AgentMessage = {
@@ -22,9 +23,15 @@ interface AgenticBotProps {
 type Point = { x: number; y: number };
 type CaptureRect = { left: number; top: number; width: number; height: number };
 
+const COLLAPSED_WIDTH = 176;
+const COLLAPSED_HEIGHT = 52;
+const PANEL_WIDTH = 390;
+const PANEL_HEIGHT = 590;
+const POSITION_STORAGE_KEY = "proofdesk_agent_position_v2";
+
 function clampPosition(point: Point, expanded: boolean): Point {
-  const width = expanded ? Math.min(390, window.innerWidth - 24) : 58;
-  const height = expanded ? Math.min(590, window.innerHeight - 24) : 58;
+  const width = expanded ? Math.min(PANEL_WIDTH, window.innerWidth - 24) : Math.min(COLLAPSED_WIDTH, window.innerWidth - 24);
+  const height = expanded ? Math.min(PANEL_HEIGHT, window.innerHeight - 24) : COLLAPSED_HEIGHT;
   return {
     x: Math.max(12, Math.min(window.innerWidth - width - 12, point.x)),
     y: Math.max(12, Math.min(window.innerHeight - height - 12, point.y)),
@@ -65,6 +72,7 @@ function cropPdfCanvas(rect: CaptureRect): string | null {
 }
 
 export function AgenticBot({ bookId, pageNumber, stage, projectTitle, activeIssueUid, onNavigatePage }: AgenticBotProps) {
+  const [mounted, setMounted] = useState(false);
   const [expanded, setExpanded] = useState(false);
   const [messages, setMessages] = useState<AgentMessage[]>([]);
   const [input, setInput] = useState("");
@@ -75,17 +83,31 @@ export function AgenticBot({ bookId, pageNumber, stage, projectTitle, activeIssu
   const [captureCurrent, setCaptureCurrent] = useState<Point | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
-  const [position, setPosition] = useState<Point>({ x: 24, y: 110 });
+  const [position, setPosition] = useState<Point>({ x: 12, y: 12 });
   const dragRef = useRef<{ pointer: Point; origin: Point } | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     if (typeof window === "undefined") return;
-    const stored = localStorage.getItem("proofdesk_agent_position");
-    const fallback = { x: Math.max(12, window.innerWidth - 420), y: Math.max(12, window.innerHeight - 650) };
+    const stored = localStorage.getItem(POSITION_STORAGE_KEY);
+    // Start above the session status bar, clearly inside the viewport. The
+    // launcher remains freely draggable after this safe initial placement.
+    const fallback = {
+      x: Math.max(12, window.innerWidth - COLLAPSED_WIDTH - 28),
+      y: Math.max(12, window.innerHeight - COLLAPSED_HEIGHT - 82),
+    };
     try { setPosition(clampPosition(stored ? JSON.parse(stored) : fallback, false)); }
     catch { setPosition(clampPosition(fallback, false)); }
+    setMounted(true);
   }, []);
+
+  // A collapsed launcher can legally sit near the right or bottom edge. When
+  // its 390px panel opens, re-clamp synchronously so it can never expand
+  // outside the visible browser area.
+  useLayoutEffect(() => {
+    if (!mounted || typeof window === "undefined") return;
+    setPosition((current) => clampPosition(current, expanded));
+  }, [expanded, mounted]);
 
   useEffect(() => {
     if (!bookId) {
@@ -106,12 +128,16 @@ export function AgenticBot({ bookId, pageNumber, stage, projectTitle, activeIssu
   }, [messages, busy]);
 
   useEffect(() => {
-    const onResize = () => setPosition((current) => clampPosition(current, expanded));
+    const onResize = () => setPosition((current) => {
+      const next = clampPosition(current, expanded);
+      localStorage.setItem(POSITION_STORAGE_KEY, JSON.stringify(next));
+      return next;
+    });
     window.addEventListener("resize", onResize);
     return () => window.removeEventListener("resize", onResize);
   }, [expanded]);
 
-  if (!bookId) return null;
+  if (!bookId || !mounted) return null;
 
   const onDragStart = (event: React.PointerEvent) => {
     if (!(event.target as HTMLElement).closest("[data-agent-drag]")) return;
@@ -127,7 +153,14 @@ export function AgenticBot({ bookId, pageNumber, stage, projectTitle, activeIssu
   };
   const onDragEnd = () => {
     dragRef.current = null;
-    localStorage.setItem("proofdesk_agent_position", JSON.stringify(position));
+    const next = clampPosition(position, expanded);
+    setPosition(next);
+    localStorage.setItem(POSITION_STORAGE_KEY, JSON.stringify(next));
+  };
+
+  const openAssistant = () => {
+    setPosition((current) => clampPosition(current, true));
+    setExpanded(true);
   };
 
   const useCurrentSelection = () => {
@@ -203,11 +236,11 @@ export function AgenticBot({ bookId, pageNumber, stage, projectTitle, activeIssu
     }
   };
 
-  return (
+  return createPortal(
     <>
       {captureMode && (
         <div
-          className="fixed inset-0 z-[500] cursor-crosshair bg-slate-950/10"
+          className="fixed inset-0 z-[9100] cursor-crosshair bg-slate-950/10"
           onPointerDown={(event) => { setCaptureStart({ x: event.clientX, y: event.clientY }); setCaptureCurrent({ x: event.clientX, y: event.clientY }); }}
           onPointerMove={(event) => captureStart && setCaptureCurrent({ x: event.clientX, y: event.clientY })}
           onPointerUp={completeCapture}
@@ -228,7 +261,7 @@ export function AgenticBot({ bookId, pageNumber, stage, projectTitle, activeIssu
       )}
 
       <div
-        className={`fixed z-[350] ${expanded ? "w-[390px] max-w-[calc(100vw-24px)]" : "w-[58px]"}`}
+        className={`fixed z-[9000] ${expanded ? "w-[390px] max-w-[calc(100vw-24px)]" : "w-[176px] max-w-[calc(100vw-24px)]"}`}
         style={{ left: position.x, top: position.y }}
         onPointerDown={onDragStart}
         onPointerMove={onDragMove}
@@ -238,12 +271,19 @@ export function AgenticBot({ bookId, pageNumber, stage, projectTitle, activeIssu
         {!expanded ? (
           <button
             data-agent-drag
-            onDoubleClick={() => setExpanded(true)}
-            onClick={() => setExpanded(true)}
-            className="h-[58px] w-[58px] rounded-2xl bg-gradient-to-br from-slate-900 to-brand-700 text-white shadow-2xl border border-white/20 flex items-center justify-center cursor-grab active:cursor-grabbing"
+            onDoubleClick={openAssistant}
+            onClick={openAssistant}
+            className="h-[52px] w-[176px] max-w-full rounded-2xl bg-gradient-to-br from-slate-900 to-brand-700 text-white shadow-2xl shadow-slate-900/25 border border-white/20 flex items-center gap-2.5 px-3.5 cursor-grab active:cursor-grabbing hover:-translate-y-0.5 transition-transform"
             title="Open project assistant (drag to move)"
           >
-            <MessageCircle className="h-6 w-6" />
+            <span className="relative flex h-8 w-8 shrink-0 items-center justify-center rounded-xl bg-white/12">
+              <MessageCircle className="h-5 w-5" />
+              <span className="absolute -right-0.5 -top-0.5 h-2.5 w-2.5 rounded-full border-2 border-slate-900 bg-emerald-400" />
+            </span>
+            <span className="min-w-0 text-left">
+              <span className="block truncate text-xs font-black tracking-wide">Project assistant</span>
+              <span className="block truncate text-[9px] font-medium text-slate-300">Drag anywhere · Click to open</span>
+            </span>
           </button>
         ) : (
           <section className="h-[590px] max-h-[calc(100vh-24px)] rounded-2xl bg-white border border-slate-200 shadow-2xl overflow-hidden flex flex-col">
@@ -304,6 +344,7 @@ export function AgenticBot({ bookId, pageNumber, stage, projectTitle, activeIssu
           </section>
         )}
       </div>
-    </>
+    </>,
+    document.body,
   );
 }
