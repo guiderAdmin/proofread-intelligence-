@@ -19,6 +19,7 @@ export interface ProofreaderIssue {
     w: number;
     h: number;
   };
+  bboxSource?: "ai" | "pdf_text";
 }
 
 export interface CustomMark {

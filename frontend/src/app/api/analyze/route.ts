@@ -6,6 +6,7 @@ import { tempPdfPath, deleteUploadObject, downloadPdfObject } from "@/server/sto
 import { getPageCount } from "@/server/services/pdf.js";
 import { enqueueBook, removeBookFiles, serializeBook } from "@/server/services/queue.js";
 import { DEFAULT_MODEL, hasAnyKey, resolveModel } from "@/server/services/gemini.js";
+import { compileProjectInstructions } from "../../../../feature/agentic-bot/server/instructions.js";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -31,6 +32,7 @@ export async function POST(request: NextRequest) {
     const bookTypeInput = String(body.bookType || "textbook").toLowerCase();
     const totalParts = Number(body.totalParts || 1);
 
+    const instructionBrief = compileProjectInstructions(body.proofreadingInstructions);
     book = await Book.create({
       title: String(body.title || originalName.replace(/\.pdf$/i, "")).trim().slice(0, 180),
       originalName: originalName.slice(0, 220),
@@ -43,6 +45,7 @@ export async function POST(request: NextRequest) {
       bookType: BOOK_TYPES.has(bookTypeInput) ? bookTypeInput : "textbook",
       model: resolveModel(body.model || process.env.GEMINI_MODEL || DEFAULT_MODEL),
       thinkingLevel: String(body.thinkingLevel || process.env.GEMINI_THINKING_LEVEL || "low"),
+      proofreadingInstructions: instructionBrief.text,
       status: "queued",
     });
 

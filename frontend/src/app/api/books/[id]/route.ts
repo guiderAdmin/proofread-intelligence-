@@ -5,6 +5,7 @@ import Page from "@/server/models/Page.js";
 import { connectDb } from "@/server/db.js";
 import { assertSameOrigin, apiError, HttpError } from "@/server/http.js";
 import { removeBookFiles, serializeBook, serializePage, tick } from "@/server/services/queue.js";
+import { deleteAgentSession } from "../../../../../feature/agentic-bot/server/knowledge.js";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -35,6 +36,7 @@ export async function DELETE(request: NextRequest, { params }: { params: { id: s
     const book = await Book.findById(params.id);
     if (!book) throw new HttpError(404, "Proofread not found");
     await Page.deleteMany({ bookId: book._id });
+    await deleteAgentSession(book._id);
     await removeBookFiles(book._id);
     await book.deleteOne();
     return NextResponse.json({ success: true });

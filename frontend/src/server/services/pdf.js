@@ -112,17 +112,24 @@ export async function extractPageLayout(doc, pageNumber) {
     if (!("str" in item) || !item.str.trim()) continue;
     const x = item.transform[4];
     const y = item.transform[5];
-    const itemWidth = item.width;
-    const itemHeight = item.height;
-    
-    const top = height - y - itemHeight;
-    const bottom = height - y;
+    const itemWidth = Number(item.width) || 0;
+    const itemHeight = Number(item.height) || Math.abs(item.transform[3]) || 10;
+
+    // Always use PDF.js' viewport transform. The old `height - y` shortcut is
+    // only correct for an unrotated crop box and drifts on rotated/cropped PDFs.
+    const [vx, vy] = viewport.convertToViewportPoint(x, y);
+    const [vxRight] = viewport.convertToViewportPoint(x + itemWidth, y);
+    const [, vyTop] = viewport.convertToViewportPoint(x, y + itemHeight);
+    const left = Math.min(vx, vxRight);
+    const right = Math.max(vx, vxRight);
+    const top = Math.min(vy, vyTop);
+    const bottom = Math.max(vy, vyTop);
     
     items.push({
       str: item.str,
-      xmin: (x / width) * 1000,
+      xmin: (left / width) * 1000,
       ymin: (top / height) * 1000,
-      xmax: ((x + itemWidth) / width) * 1000,
+      xmax: (right / width) * 1000,
       ymax: (bottom / height) * 1000,
     });
   }
@@ -178,64 +185,82 @@ export function bookFilePath(uploadsDir, bookId, originalName) {
 
 export function snapIssuesToLayout(issues, layoutItems) {
   if (!issues || !issues.length || !layoutItems || !layoutItems.length) return;
-  
-  let fullText = "";
-  const charToItem = [];
-  
-  for (let i = 0; i < layoutItems.length; i++) {
-    const item = layoutItems[i];
-    const startIdx = fullText.length;
-    fullText += item.str + " "; 
-    for (let j = startIdx; j < fullText.length; j++) {
-      charToItem[j] = i;
-    }
-  }
-  
-  const cleanStr = (s) => s.toLowerCase().replace(/[\s\W_]+/g, "");
-  const targetFull = cleanStr(fullText);
-  
-  const cleanToFullMap = [];
-  for (let i = 0; i < fullText.length; i++) {
-    if (/[a-zA-Z0-9]/.test(fullText[i])) { 
-       cleanToFullMap.push(i);
-    }
-  }
 
-  for (const issue of issues) {
-    // Gemini response boxes are normalized to `box` before this function runs.
-    if (!issue.quote || !issue.box) continue;
-    const cleanQuote = cleanStr(issue.quote);
-    if (!cleanQuote) continue;
-    
-    const matches = [];
-    let startPos = 0;
-    while (true) {
-      const idx = targetFull.indexOf(cleanQuote, startPos);
-      if (idx === -1) break;
-      
-      const startFullIdx = cleanToFullMap[idx];
-      const endFullIdx = cleanToFullMap[idx + cleanQuote.length - 1];
-      
-      if (startFullIdx !== undefined && endFullIdx !== undefined) {
-        const startItemIdx = charToItem[startFullIdx];
-        const endItemIdx = charToItem[endFullIdx];
-        
-        let minX = 1000, minY = 1000, maxX = 0, maxY = 0;
-        for (let i = startItemIdx; i <= endItemIdx; i++) {
-          const it = layoutItems[i];
-          if (!it) continue;
-          minX = Math.min(minX, it.xmin);
-          minY = Math.min(minY, it.ymin);
-          maxX = Math.max(maxX, it.xmax);
-          maxY = Math.max(maxY, it.ymax);
-        }
-        if (minX <= maxX) {
-          matches.push({ xmin: minX, ymin: minY, xmax: maxX, ymax: maxY });
+  const superscriptDigits = { "⁰": "0", "¹": "1", "²": "2", "³": "3", "⁴": "4", "⁵": "5", "⁶": "6", "⁷": "7", "⁸": "8", "⁹": "9" };
+  const tokenize = (value) => String(value || "")
+    .normalize("NFKC")
+    .replace(/[⁰¹²³⁴⁵⁶⁷⁸⁹]/g, (char) => superscriptDigits[char] || char)
+    .replace(/([\p{L}])([\p{N}])/gu, "$1 $2")
+    .replace(/([\p{N}])([\p{L}])/gu, "$1 $2")
+    .toLowerCase()
+    .match(/[\p{L}\p{N}]+/gu) || [];
+
+  const sourceTokens = layoutItems.flatMap((item, itemIndex) =>
+    tokenize(item.str).map((text) => ({ text, itemIndex }))
+  );
+
+  // Most PDFs expose content in reading order. Some layout programs emit
+  // decorations first, so keep a geometry-ordered fallback. Grouping by a
+  // relaxed baseline tolerance keeps superscripts with their sentence.
+  const visualItems = layoutItems
+    .map((item, itemIndex) => ({ ...item, itemIndex }))
+    .sort((a, b) => {
+      const aMid = (a.ymin + a.ymax) / 2;
+      const bMid = (b.ymin + b.ymax) / 2;
+      const tolerance = Math.max(8, Math.min(a.ymax - a.ymin, b.ymax - b.ymin) * 0.8);
+      return Math.abs(aMid - bMid) <= tolerance ? a.xmin - b.xmin : aMid - bMid;
+    });
+  const visualTokens = visualItems.flatMap((item) =>
+    tokenize(item.str).map((text) => ({ text, itemIndex: item.itemIndex }))
+  );
+
+  const findExactMatches = (tokens, target) => {
+    const found = [];
+    for (let start = 0; start <= tokens.length - target.length; start += 1) {
+      let matches = true;
+      for (let offset = 0; offset < target.length; offset += 1) {
+        if (tokens[start + offset].text !== target[offset]) {
+          matches = false;
+          break;
         }
       }
-      startPos = idx + 1;
+      if (matches) {
+        found.push([...new Set(tokens.slice(start, start + target.length).map((token) => token.itemIndex))]);
+      }
     }
-    
+    return found;
+  };
+
+  for (const issue of issues) {
+    // Gemini boxes are visual hints, never proof of the text location.
+    issue.boxSource = "ai";
+    if (!issue.quote || !issue.box) continue;
+    const target = tokenize(issue.quote);
+    if (!target.length) continue;
+    // A bare numeral cannot be distinguished from page numbers, labels, and
+    // decorative badges. Leave it unverified instead of snapping to the model's
+    // preferred occurrence.
+    if (target.length === 1 && /^\d+$/.test(target[0])) continue;
+
+    const itemMatches = [
+      ...findExactMatches(sourceTokens, target),
+      ...findExactMatches(visualTokens, target),
+    ];
+    const seen = new Set();
+    const matches = itemMatches.map((itemIndexes) => {
+      const key = [...itemIndexes].sort((a, b) => a - b).join(",");
+      if (seen.has(key)) return null;
+      seen.add(key);
+      const items = itemIndexes.map((index) => layoutItems[index]).filter(Boolean);
+      if (!items.length) return null;
+      return {
+        xmin: Math.min(...items.map((item) => item.xmin)),
+        ymin: Math.min(...items.map((item) => item.ymin)),
+        xmax: Math.max(...items.map((item) => item.xmax)),
+        ymax: Math.max(...items.map((item) => item.ymax)),
+      };
+    }).filter(Boolean);
+
     if (matches.length > 0) {
        const ai = [issue.box.ymin, issue.box.xmin, issue.box.ymax, issue.box.xmax];
        const aiCenterY = (ai[0] + ai[2]) / 2;
@@ -260,6 +285,7 @@ export function snapIssuesToLayout(issues, layoutItems) {
          ymax: Math.min(1000, bestMatch.ymax + 5),
          xmax: Math.min(1000, bestMatch.xmax + 5),
        };
+       issue.boxSource = "pdf_text";
     }
   }
 }

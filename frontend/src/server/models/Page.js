@@ -43,6 +43,11 @@ const issueSchema = new mongoose.Schema(
       ymax: { type: Number, default: 1000 },
       xmax: { type: Number, default: 1000 },
     },
+    boxSource: {
+      type: String,
+      enum: ["ai", "pdf_text"],
+      default: "ai",
+    },
     confidence: { type: Number, default: 0.7 },
     status: {
       type: String,

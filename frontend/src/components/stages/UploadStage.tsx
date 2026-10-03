@@ -1,7 +1,7 @@
 "use client";
 import React, { useState, useRef } from "react";
 import { createPortal } from "react-dom";
-import { UploadCloud, ChevronRight, File as FileIcon, ChevronDown, FolderOpen, Clock3, ArrowRight, Zap, X, Cpu, Sparkles, Settings, CheckCircle2, Trash2 } from "lucide-react";
+import { UploadCloud, ChevronRight, File as FileIcon, ChevronDown, FolderOpen, Clock3, ArrowRight, Zap, X, Cpu, Sparkles, Settings, CheckCircle2, Trash2, Bot } from "lucide-react";
 
 interface SavedBookSummary {
   id: string;
@@ -24,7 +24,7 @@ interface UploadStageProps {
     rawFile?: File;
   } | null;
   onFileSelect: (file: File) => void;
-  onStartAnalysis: (scanTypes: string[], classLevel: string, subject: string, language: string, delaySeconds: number) => void;
+  onStartAnalysis: (scanTypes: string[], classLevel: string, subject: string, language: string, delaySeconds: number, instructions: string) => void;
   savedBooks?: SavedBookSummary[];
   savedBooksLoading?: boolean;
   onOpenSaved?: (book: SavedBookSummary) => void;
@@ -41,6 +41,7 @@ export function UploadStage({ selectedFile, onFileSelect, onStartAnalysis, saved
   const [subject, setSubject] = useState<string>("");
   const [language, setLanguage] = useState<string>("");
   const [delaySeconds, setDelaySeconds] = useState<number>(0);
+  const [instructions, setInstructions] = useState<string>("");
   const [fileError, setFileError] = useState<string>("");
   const [isDragOver, setIsDragOver] = useState(false);
 
@@ -270,7 +271,7 @@ export function UploadStage({ selectedFile, onFileSelect, onStartAnalysis, saved
 
           {/* Modal Card */}
           <div
-            className="relative z-10 bg-[#faf8f5] border border-stone-200/80 rounded-2xl shadow-2xl p-7 md:p-9 space-y-6 w-full max-w-lg animate-in fade-in zoom-in-95 duration-200"
+            className="relative z-10 bg-[#faf8f5] border border-stone-200/80 rounded-2xl shadow-2xl p-7 md:p-9 space-y-6 w-full max-w-lg max-h-[calc(100vh-2rem)] overflow-y-auto custom-scrollbar animate-in fade-in zoom-in-95 duration-200"
             onClick={(e) => e.stopPropagation()}
           >
             {/* Card Header */}
@@ -388,10 +389,25 @@ export function UploadStage({ selectedFile, onFileSelect, onStartAnalysis, saved
               </div>
             </div>
 
+            <div className="space-y-1.5">
+              <label className="flex items-center gap-1.5 text-[11px] font-bold text-stone-500 uppercase tracking-wider">
+                <Bot className="h-3.5 w-3.5 text-brand-500" /> Project assistant instructions
+              </label>
+              <textarea
+                value={instructions}
+                onChange={(event) => setInstructions(event.target.value)}
+                maxLength={2000}
+                rows={3}
+                placeholder="Optional: Use British English, preserve quotations, check footnote placement…"
+                className="w-full resize-none bg-white border border-stone-200 rounded-xl px-4 py-3 text-sm font-medium text-stone-800 focus:outline-none focus:border-brand-400 focus:ring-1 focus:ring-brand-300/30 transition-all placeholder:text-stone-400"
+              />
+              <p className="text-[10px] text-stone-400">Duplicate built-in rules are ignored. These instructions are saved with the project and available to the moving assistant.</p>
+            </div>
+
             {/* Start button */}
             <button
               onClick={() => {
-                onStartAnalysis(["grammar", "object", "fact"], classLevel, subject.trim(), language, delaySeconds);
+                onStartAnalysis(["grammar", "object", "fact"], classLevel, subject.trim(), language, delaySeconds, instructions.trim());
                 closeModal();
               }}
               disabled={!canStart}

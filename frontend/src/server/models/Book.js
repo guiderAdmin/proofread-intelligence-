@@ -21,6 +21,7 @@ const bookSchema = new mongoose.Schema(
     },
     model: { type: String, default: "gemini-3.6-flash" },
     thinkingLevel: { type: String, default: "low" },
+    proofreadingInstructions: { type: String, default: "", maxlength: 2000 },
     status: {
       type: String,
       enum: ["queued", "processing", "paused", "done", "error"],

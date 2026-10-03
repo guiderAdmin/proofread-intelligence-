@@ -28,6 +28,7 @@ const AppSidebar = dynamic(
 
 import { ProofreaderResponse, ProofreaderIssue, CustomMark, ProofreaderPageData } from "@/types/proofreader";
 import { locateIssuesInPdf } from "@/lib/pdf-text-locator";
+import { AgenticBot } from "../../feature/agentic-bot";
 
 interface SavedBook {
   id: string;
@@ -291,6 +292,7 @@ export default function ProofreaderFlow() {
       locationHint: issue.locationHint ?? issue.location ?? (pageNum ? `Page ${pageNum}` : ""),
       confidence: issue.confidence ?? 1.0,
       bbox,
+      bboxSource: issue.bboxSource ?? issue.boxSource,
       resolved: issue.status === "accepted" || issue.status === "fixed" || !!issue.resolved,
       ignored: issue.status === "dismissed" || !!issue.ignored,
     };
@@ -463,7 +465,7 @@ export default function ProofreaderFlow() {
   };
 
 
-  const startAnalysis = async (scanTypes: string[], classLevel: string, subject: string, language: string, activeDelay: number) => {
+  const startAnalysis = async (scanTypes: string[], classLevel: string, subject: string, language: string, activeDelay: number, instructions: string) => {
     if (!selectedFile?.rawFile) return;
 
     setActiveScanTypes(scanTypes);
@@ -559,6 +561,7 @@ export default function ProofreaderFlow() {
           language: language.toLowerCase().includes("hindi") ? "hindi" : "english",
           bookType: "textbook",
           delaySeconds: activeDelay.toString(),
+          proofreadingInstructions: instructions,
         }),
       });
       let created: any = {};
@@ -1272,6 +1275,15 @@ export default function ProofreaderFlow() {
         currentPage={currentPage}
         setCurrentPage={setCurrentPage}
         issues={issues}
+      />
+
+      <AgenticBot
+        bookId={activeJobId}
+        pageNumber={currentPage}
+        stage={stage}
+        projectTitle={selectedFile?.name}
+        activeIssueUid={issues.find((issue) => issue.id === activeIssueId)?.backendUid}
+        onNavigatePage={(page) => { setCurrentPage(page); setStage("review"); }}
       />
 
       {/* Main Content Area */}

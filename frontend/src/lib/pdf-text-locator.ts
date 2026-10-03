@@ -33,22 +33,39 @@ interface PageCache {
 
 // ── String helpers ────────────────────────────────────────────────────────────
 
-/** Remove punctuation, collapse whitespace, lowercase. */
-const norm = (s: string) =>
-  s.toLowerCase()
-    .replace(/[^a-z0-9 ]/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
+const SUPERSCRIPT_DIGITS: Record<string, string> = {
+  "⁰": "0", "¹": "1", "²": "2", "³": "3", "⁴": "4",
+  "⁵": "5", "⁶": "6", "⁷": "7", "⁸": "8", "⁹": "9",
+};
 
-/** Simple character overlap similarity (0–1). */
+/** Make `scriptures1`, `scriptures 1`, and `scriptures¹` equivalent. */
+export function tokenizeForLocation(value: string): string[] {
+  return String(value || "")
+    .normalize("NFKC")
+    .replace(/[⁰¹²³⁴⁵⁶⁷⁸⁹]/g, (char) => SUPERSCRIPT_DIGITS[char] || char)
+    .replace(/([\p{L}])([\p{N}])/gu, "$1 $2")
+    .replace(/([\p{N}])([\p{L}])/gu, "$1 $2")
+    .toLowerCase()
+    .match(/[\p{L}\p{N}]+/gu) || [];
+}
+
+/** Levenshtein similarity, used only for complete multi-token phrases. */
 function similarity(a: string, b: string): number {
   if (!a || !b) return 0;
   if (a === b) return 1;
-  const [long, short] = a.length >= b.length ? [a, b] : [b, a];
-  if (long.includes(short)) return short.length / long.length;
-  let hits = 0;
-  for (const ch of short) if (long.includes(ch)) hits++;
-  return hits / long.length;
+  const matrix = Array.from({ length: a.length + 1 }, () => new Array<number>(b.length + 1).fill(0));
+  for (let i = 0; i <= a.length; i += 1) matrix[i][0] = i;
+  for (let j = 0; j <= b.length; j += 1) matrix[0][j] = j;
+  for (let i = 1; i <= a.length; i += 1) {
+    for (let j = 1; j <= b.length; j += 1) {
+      matrix[i][j] = Math.min(
+        matrix[i - 1][j] + 1,
+        matrix[i][j - 1] + 1,
+        matrix[i - 1][j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1),
+      );
+    }
+  }
+  return 1 - matrix[a.length][b.length] / Math.max(a.length, b.length);
 }
 
 // ── Core search ───────────────────────────────────────────────────────────────
@@ -56,82 +73,78 @@ function similarity(a: string, b: string): number {
 /**
  * Search for `searchText` inside the word list of a page.
  *
- * Strategy 1 – exact substring: join all normalised words into one string
- *   and look for the search phrase as a contiguous substring.  This is the
- *   most accurate path and avoids false positives on common words.
- *
- * Strategy 2 – progressive fuzzy: tries full-length → 5 → 3 → 2 → 1 word
- *   prefix matching with 78 % character-overlap tolerance per word.
- *
- * Matched regions are capped at 8 words to prevent cross-line rectangles.
+ * Search both PDF content order and geometry-derived reading order. Exact
+ * complete-quote matches win; conservative fuzzy matching is limited to
+ * complete multi-token quotes. Gemini's box only disambiguates duplicates.
  */
-function findInWords(
+interface LocatedToken extends WordBox {
+  normalized: string;
+}
+
+function tokenStream(words: WordBox[]): LocatedToken[] {
+  return words.flatMap((word) =>
+    tokenizeForLocation(word.text).map((normalized) => ({ ...word, normalized }))
+  );
+}
+
+function visualWordOrder(words: WordBox[]): WordBox[] {
+  return [...words].sort((a, b) => {
+    const aMid = a.y + a.height / 2;
+    const bMid = b.y + b.height / 2;
+    const tolerance = Math.max(4, Math.min(a.height, b.height) * 0.8);
+    return Math.abs(aMid - bMid) <= tolerance ? a.x - b.x : aMid - bMid;
+  });
+}
+
+function bboxDistance(a: BBox, b?: BBox): number {
+  if (!b) return 0;
+  return Math.hypot(
+    a.x + a.w / 2 - (b.x + b.w / 2),
+    a.y + a.h / 2 - (b.y + b.h / 2),
+  );
+}
+
+export function findInWords(
   words: WordBox[],
   pageWidth: number,
   pageHeight: number,
-  searchText: string
+  searchText: string,
+  hint?: BBox,
 ): BBox | null {
   if (!searchText || !searchText.trim() || searchText.length < 2) return null;
-
-  const searchNorm = norm(searchText);
-  if (!searchNorm) return null;
-
-  // Pre-compute normalised word strings once
-  const normed = words.map(w => norm(w.text));
-
-  // ── Strategy 1: exact substring of concatenated page text ────────────
-  if (searchNorm.length >= 3) {
-    const fullText = normed.join(" ");
-    const idx = fullText.indexOf(searchNorm);
-    if (idx !== -1) {
-      let charPos = 0;
-      let startW = -1;
-      let endW = -1;
-      for (let i = 0; i < normed.length; i++) {
-        const wEnd = charPos + normed[i].length;
-        if (startW === -1 && wEnd > idx) startW = i;
-        if (wEnd >= idx + searchNorm.length) { endW = i; break; }
-        charPos = wEnd + 1; // +1 for the joining space
-      }
-      if (startW >= 0 && endW >= startW) {
-        // Return exactly the matched words (no arbitrary length capping)
-        return toBBox(words.slice(startW, endW + 1), pageWidth, pageHeight);
-      }
-    }
-  }
-
-  // ── Strategy 2: progressive word-by-word fuzzy matching ──────────────
-  const targets = searchNorm.split(" ").filter(Boolean);
+  const targets = tokenizeForLocation(searchText);
   if (!targets.length) return null;
+  if (targets.length === 1 && /^\d+$/.test(targets[0])) return null;
 
-  // Only fallback to smaller lengths if the original was small,
-  // or allow at most dropping a couple words from the end (e.g. for punctuation mismatch)
-  const lengths = Array.from(new Set([
-    targets.length,
-    Math.max(2, targets.length - 1),
-    Math.max(1, targets.length - 2)
-  ])).filter(len => len > 0 && len <= targets.length).sort((a,b) => b-a);
-
-  for (const matchLen of lengths) {
-    if (matchLen < 1) continue;
-    const pattern = targets.slice(0, matchLen);
-
-    for (let i = 0; i <= words.length - matchLen; i++) {
-      let ok = true;
-      for (let k = 0; k < matchLen; k++) {
-        const wNorm = normed[i + k];
-        const tNorm = pattern[k];
-        if (wNorm !== tNorm && !wNorm.includes(tNorm) && !tNorm.includes(wNorm) && similarity(wNorm, tNorm) < 0.78) {
-          ok = false;
-          break;
-        }
-      }
-      if (ok) {
-        return toBBox(words.slice(i, i + matchLen), pageWidth, pageHeight);
+  const exact: BBox[] = [];
+  const fuzzy: Array<{ box: BBox; score: number }> = [];
+  const seen = new Set<string>();
+  for (const stream of [tokenStream(words), tokenStream(visualWordOrder(words))]) {
+    for (let start = 0; start <= stream.length - targets.length; start += 1) {
+      const slice = stream.slice(start, start + targets.length);
+      const scores = targets.map((target, index) => similarity(target, slice[index].normalized));
+      const isExact = scores.every((score) => score === 1);
+      const average = scores.reduce((sum, score) => sum + score, 0) / scores.length;
+      const isFuzzy = targets.length >= 2 && scores.every((score) => score >= 0.72) && average >= 0.86;
+      if (!isExact && !isFuzzy) continue;
+      const box = toBBox(slice, pageWidth, pageHeight);
+      if (!box) continue;
+      const key = [box.x, box.y, box.w, box.h].map((value) => value.toFixed(3)).join(":");
+      if (seen.has(key)) continue;
+      seen.add(key);
+      if (isExact) exact.push(box);
+      else {
+        fuzzy.push({ box, score: average });
       }
     }
   }
 
+  if (exact.length) return exact.sort((a, b) => bboxDistance(a, hint) - bboxDistance(b, hint))[0];
+  if (fuzzy.length) {
+    return fuzzy.sort((a, b) =>
+      (b.score - a.score) || (bboxDistance(a.box, hint) - bboxDistance(b.box, hint))
+    )[0].box;
+  }
   return null;
 }
 
@@ -163,20 +176,31 @@ function toBBox(words: WordBox[], pageWidth: number, pageHeight: number): BBox |
  * Load the PDF once and resolve the exact bounding box for every issue's
  * `originalText` on its respective page.
  *
- * Issues that already have a bbox (manually drawn) are left untouched.
- * Issues whose text cannot be found are also left untouched (bbox stays undefined).
+ * Model boxes for textual issues are replaced only by grounded PDF text boxes.
+ * If grounding fails, an unverified textual box is removed rather than shown
+ * at an unrelated location. Inherently visual findings keep the model box.
  *
  * Returns a new array — original objects are not mutated.
  */
 export async function locateIssuesInPdf<
   T extends {
     originalText?: string;
+    type?: string;
     page?: number | null;
     pageIndex?: number | null;
     bbox?: BBox;
+    bboxSource?: "ai" | "pdf_text";
   }
 >(pdfFile: File, issues: T[]): Promise<T[]> {
   if (!pdfFile || !issues.length) return issues;
+
+  const visualTypes = new Set(["image", "alignment", "layout", "typography", "spacing", "overflow"]);
+  const keepOrRemoveUnverified = (issue: T): T => {
+    if (visualTypes.has(String(issue.type || "").toLowerCase())) return issue;
+    if (issue.bboxSource === "pdf_text") return issue;
+    const { bbox: _unverifiedBox, ...withoutBox } = issue;
+    return withoutBox as T;
+  };
 
   try {
     // Dynamic import keeps pdfjs out of SSR
@@ -271,14 +295,6 @@ export async function locateIssuesInPdf<
           }
         }
 
-        // Sort words visually: top-to-bottom, left-to-right.
-        words.sort((a, b) => {
-          if (Math.abs(a.y - b.y) > 5) {
-            return a.y - b.y;
-          }
-          return a.x - b.x;
-        });
-
         return { words, pageWidth: vp.width, pageHeight: vp.height };
       })();
       return cache[pageNum];
@@ -288,20 +304,22 @@ export async function locateIssuesInPdf<
     const updated = await Promise.all(
       issues.map(async (issue): Promise<T> => {
         const text = issue.originalText;
-        // Minimum phrase length to avoid false positives on single letters
-        if (!text || text.trim().length < 3) return issue;
+
+        // A single character is too ambiguous to ground safely on a page.
+        if (!text || text.trim().length < 2) return keepOrRemoveUnverified(issue);
 
         const pageNum = issue.page ?? issue.pageIndex ?? 1;
-        if (!pageNum) return issue;
+        if (!pageNum) return keepOrRemoveUnverified(issue);
 
         const p = await getCache(pageNum);
-        if (!p) return issue;
+        if (!p) return keepOrRemoveUnverified(issue);
 
-        const bbox = findInWords(p.words, p.pageWidth, p.pageHeight, text);
-        // If we found an exact match via PDF text extraction, it's perfectly accurate.
-        // Otherwise, fallback to the AI-provided approximation (issue.bbox).
-        if (bbox) return { ...issue, bbox };
-        return issue;
+        const bbox = findInWords(p.words, p.pageWidth, p.pageHeight, text, issue.bbox);
+        if (bbox) return { ...issue, bbox, bboxSource: "pdf_text" };
+
+        // Gemini rectangles are valid fallbacks for visual findings, but they
+        // must not masquerade as exact evidence for quoted text.
+        return keepOrRemoveUnverified(issue);
       })
     );
 
@@ -309,6 +327,6 @@ export async function locateIssuesInPdf<
     return updated;
   } catch (err) {
     console.error("[pdf-text-locator] Failed:", err);
-    return issues; // graceful fallback — issues still display, just without bbox overlay
+    return issues.map(keepOrRemoveUnverified);
   }
 }

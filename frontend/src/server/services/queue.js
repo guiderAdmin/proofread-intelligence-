@@ -10,6 +10,7 @@ import { emit } from "./bus.js";
 import { extractPageText, extractPageLayout, snapIssuesToLayout, renderPageJpeg, withPdf, extractSinglePagePdf } from "./pdf.js";
 import { analyzePageImage, friendlyError, sleep, withRetry } from "./gemini.js";
 import { extractBookStructure, getPageContextFromStructure } from "./structure.js";
+import { getAgentKnowledgeForAnalysis } from "../../../feature/agentic-bot/server/knowledge.js";
 import { uploadPageImage, deleteAllPageImages, deleteUploadObject, downloadPdfObject, tempPdfPath } from "../storage.js";
 
 const state = {
@@ -187,6 +188,7 @@ export function serializeBook(book) {
     bookType: b.bookType,
     model: b.model,
     thinkingLevel: b.thinkingLevel,
+    proofreadingInstructions: b.proofreadingInstructions,
     status: b.status,
     progress: b.progress,
     stats: b.stats,
@@ -265,16 +267,8 @@ async function processOnePage(pageDoc) {
     pageDoc.pageNumber
   );
 
-  const prevPage =
-    pageDoc.pageNumber > 1
-      ? await Page.findOne({ bookId: book._id, pageNumber: pageDoc.pageNumber - 1 }).lean()
-      : null;
-  const nextPage =
-    pageDoc.pageNumber < book.pageCount
-      ? await Page.findOne({ bookId: book._id, pageNumber: pageDoc.pageNumber + 1 }).lean()
-      : null;
-
   console.log(`[page ${pageDoc.pageNumber}] calling Gemini`);
+  const agentKnowledge = await getAgentKnowledgeForAnalysis(book._id, pageDoc.pageNumber);
   const result = await withRetry(() =>
     analyzePageImage({
       pdfBytes,
@@ -286,13 +280,13 @@ async function processOnePage(pageDoc) {
       classLevel: book.classLevel,
       subject: book.subject,
       textExtract: pageDoc.textExtract,
-      prevPageSnippet: prevPage?.textExtract || "",
-      nextPageSnippet: nextPage?.textExtract || "",
       expectedUnit,
       expectedChapter,
       tocSummary,
       model: book.model,
       thinkingLevel: book.thinkingLevel,
+      projectInstructions: book.proofreadingInstructions || "",
+      knowledgeContext: agentKnowledge,
     })
   );
 

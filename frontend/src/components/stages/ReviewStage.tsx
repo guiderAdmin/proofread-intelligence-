@@ -368,55 +368,6 @@ export function ReviewStage({
     }
   }, [selectedFile]);
 
-  // Dynamic text highlighting within the PDF text layer
-  React.useEffect(() => {
-    if (!activeIssue || (activeIssue.page ?? activeIssue.pageIndex) !== currentPage || activeIssue.resolved || activeIssue.ignored) {
-      return;
-    }
-
-    const textToFind = activeIssue.originalText?.trim();
-    if (!textToFind || textToFind.length < 3) return;
-
-    // Small timeout to ensure the PDF text layer DOM is fully rendered
-    const timer = setTimeout(() => {
-      const textLayer = pageContainerRef.current?.querySelector(".react-pdf__Page__textLayer");
-      if (!textLayer) return;
-
-      // Clean up previous custom highlights
-      const prevHighlights = textLayer.querySelectorAll("mark.ai-highlight");
-      prevHighlights.forEach((el) => {
-        const textNode = document.createTextNode(el.textContent || "");
-        el.parentNode?.replaceChild(textNode, el);
-      });
-      textLayer.normalize();
-
-      const spans = Array.from(textLayer.querySelectorAll("span"));
-      spans.forEach((span) => {
-        const text = span.textContent || "";
-        if (text.toLowerCase().includes(textToFind.toLowerCase())) {
-          const index = text.toLowerCase().indexOf(textToFind.toLowerCase());
-          const before = text.substring(0, index);
-          const match = text.substring(index, index + textToFind.length);
-          const after = text.substring(index + textToFind.length);
-
-          // Escape user-controlled content to prevent XSS via innerHTML
-          const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
-          const titleAttr = esc(`${activeIssue.type}: ${activeIssue.explanation}`);
-
-          span.innerHTML = `${esc(before)}<mark class="ai-highlight bg-yellow-200/80 border-b-2 border-amber-500 text-slate-900 rounded px-0.5 cursor-help" style="background-color: rgba(254, 240, 138, 0.8);" title="${titleAttr}">${esc(match)}</mark>${esc(after)}`;
-          
-          // Store the highlight element for LeaderLine to attach to
-          setTimeout(() => {
-            const el = textLayer.querySelector("mark.ai-highlight") as HTMLElement;
-            if (el) setActiveHighlightEl(el);
-          }, 50);
-        }
-      });
-    }, 350);
-
-    return () => clearTimeout(timer);
-  }, [activeIssue, currentPage, fileUrl]);
-
   const onDocumentLoadSuccess = ({ numPages }: { numPages: number }) => {
     setNumPages(numPages);
   };
