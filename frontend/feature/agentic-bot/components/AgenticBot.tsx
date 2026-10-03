@@ -194,7 +194,8 @@ export function AgenticBot({ bookId, pageNumber, stage, projectTitle, activeIssu
     if (!dragRef.current) return;
     const dx = event.clientX - dragRef.current.pointer.x;
     const dy = event.clientY - dragRef.current.pointer.y;
-    if (!dragRef.current.moved && Math.hypot(dx, dy) < 3) return;
+    // Allow natural hand/trackpad jitter without turning a click into a drag.
+    if (!dragRef.current.moved && Math.hypot(dx, dy) < 8) return;
     dragRef.current.moved = true;
     setPosition(clampPosition({
       x: dragRef.current.origin.x + dx,
@@ -209,6 +210,8 @@ export function AgenticBot({ bookId, pageNumber, stage, projectTitle, activeIssu
     if (moved) {
       suppressClickRef.current = true;
       window.setTimeout(() => { suppressClickRef.current = false; }, 0);
+    } else if (!expanded) {
+      openAssistant();
     }
   };
 
@@ -346,9 +349,8 @@ export function AgenticBot({ bookId, pageNumber, stage, projectTitle, activeIssu
         {!expanded ? (
           <button
             data-agent-drag
-            onClick={openAssistant}
-            className="group relative flex h-[68px] w-[68px] cursor-grab items-center justify-center rounded-full border-[3px] border-white bg-gradient-to-br from-orange-400 via-brand-500 to-brand-700 text-white shadow-[0_16px_42px_rgba(224,94,60,0.42)] ring-1 ring-orange-300/70 transition-[transform,box-shadow] duration-300 hover:scale-105 hover:shadow-[0_20px_52px_rgba(224,94,60,0.52)] active:cursor-grabbing active:scale-100"
-            title="Proof Intelligence — drag freely or click to talk"
+            onClick={(event) => { if (event.detail === 0) openAssistant(); }}
+            className="group relative flex h-[68px] w-[68px] cursor-grab items-center justify-center rounded-full border-[3px] border-white bg-gradient-to-br from-orange-400 via-brand-500 to-brand-700 text-white shadow-[0_16px_42px_rgba(224,94,60,0.42)] ring-1 ring-orange-300/70 transition-[transform,box-shadow] duration-300 hover:scale-105 hover:shadow-[0_20px_52px_rgba(224,94,60,0.52)] focus-visible:outline-none focus-visible:ring-4 focus-visible:ring-orange-300 active:cursor-grabbing active:scale-100"
             aria-label="Open Proof Intelligence; drag to move"
           >
             <span className="absolute inset-[-8px] -z-10 rounded-full bg-orange-400/20 blur-md transition group-hover:bg-orange-400/30" />
@@ -361,7 +363,9 @@ export function AgenticBot({ bookId, pageNumber, stage, projectTitle, activeIssu
           </button>
         ) : (
           <section
-            className="flex flex-col overflow-hidden rounded-[26px] border border-orange-200/80 bg-white/95 shadow-[0_28px_80px_rgba(61,39,29,0.22),0_8px_24px_rgba(224,94,60,0.12)] ring-1 ring-white backdrop-blur-xl"
+            className="relative flex min-h-0 flex-col overflow-hidden rounded-[26px] border border-orange-200/80 bg-white/95 shadow-[0_28px_80px_rgba(61,39,29,0.22),0_8px_24px_rgba(224,94,60,0.12)] ring-1 ring-white backdrop-blur-xl"
+            role="dialog"
+            aria-label="Proof Intelligence"
             style={{
               width: "min(340px, calc(100vw - 24px))",
               height: "min(500px, calc(100vh - 24px))",
@@ -385,7 +389,7 @@ export function AgenticBot({ bookId, pageNumber, stage, projectTitle, activeIssu
               <button onPointerDown={(e) => e.stopPropagation()} onClick={() => setExpanded(false)} className="rounded-full border border-orange-100 bg-white p-2 text-slate-500 shadow-sm transition hover:border-orange-200 hover:bg-orange-50 hover:text-brand-600" aria-label="Let companion rest"><ChevronDown className="h-4 w-4" /></button>
             </header>
 
-            <div ref={scrollRef} className="custom-scrollbar flex-1 space-y-4 overflow-y-auto bg-gradient-to-b from-white to-orange-50/25 px-4 py-4">
+            <div ref={scrollRef} role="log" aria-live="polite" aria-relevant="additions" className="custom-scrollbar min-h-0 flex-1 space-y-4 overflow-y-auto overscroll-contain bg-gradient-to-b from-white to-orange-50/25 px-4 py-4">
               {messages.length === 0 && (
                 <div className="pt-2">
                   <div className="mb-4 flex items-start gap-3">
@@ -411,7 +415,7 @@ export function AgenticBot({ bookId, pageNumber, stage, projectTitle, activeIssu
                     <span className="text-[9px] font-black uppercase tracking-[0.12em] text-slate-400">{message.role === "user" ? "You" : "Proof Intelligence"}</span>
                     {message.pageNumber && <span className="text-[9px] font-medium text-slate-300">Page {message.pageNumber}</span>}
                   </div>
-                  <div className={`text-[12px] leading-relaxed ${message.role === "user" ? "ml-auto max-w-[88%] rounded-2xl rounded-tr-md bg-slate-900 px-3.5 py-2.5 text-white" : "pl-9 text-slate-700"}`}>
+                  <div className={`break-words text-[12px] leading-relaxed ${message.role === "user" ? "ml-auto max-w-[88%] rounded-2xl rounded-tr-md bg-slate-900 px-3.5 py-2.5 text-white" : "pl-9 text-slate-700"}`}>
                     {message.role === "user" ? message.content : <ResponseText content={message.content} />}
                     {message.hasCapture && <span className="mt-1 block text-[9px] opacity-60">Page region shared</span>}
                   </div>
@@ -448,6 +452,7 @@ export function AgenticBot({ bookId, pageNumber, stage, projectTitle, activeIssu
               </div>
               <p className="text-center text-[8px] font-medium tracking-wide text-slate-400">No AI request is made until you open or ask</p>
             </div>
+            <div className="pointer-events-none absolute bottom-1.5 right-1.5 h-3 w-3 border-b-2 border-r-2 border-orange-300/80" aria-hidden="true" />
           </section>
         )}
       </div>
