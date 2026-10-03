@@ -3,7 +3,7 @@
 import React from "react";
 import {
   FileText, Settings,
-  Hexagon, ChevronLeft, ChevronRight, X
+  ChevronLeft, ChevronRight, X
 } from "lucide-react";
 import { PagesPreview } from "./PagesPreview";
 import { ProofreaderIssue } from "@/types/proofreader";
@@ -40,9 +40,15 @@ export function AppSidebar({
       {/* 1. Leftmost Icon Rail */}
       <div className="w-16 bg-white border-r border-slate-200 flex flex-col justify-between items-center py-6 shadow-sm z-50 shrink-0">
         <div className="flex flex-col gap-5 items-center">
-          {/* Logo */}
-          <div className="w-10 h-10 mb-2 flex items-center justify-center bg-gradient-to-br from-brand-500 to-brand-600 rounded-lg shadow-sm shadow-brand-500/20 shrink-0">
-            <Hexagon className="h-5 w-5 text-white" />
+          {/* Proof Intelligence dock. The live orb is rendered over this
+              target from its isolated feature portal. It remains visible as
+              an empty home ring while the orb is pulled into the workspace. */}
+          <div
+            id="proof-intelligence-dock"
+            className="relative mb-2 flex h-12 w-12 shrink-0 items-center justify-center rounded-full border-2 border-dashed border-orange-200 bg-gradient-to-br from-orange-50 to-white shadow-inner"
+            aria-label="Proof Intelligence home"
+          >
+            <span className="h-7 w-7 rounded-full border border-orange-100 bg-white/80" />
           </div>
 
           {/* PDF Pages Preview — always visible, opens drawer */}

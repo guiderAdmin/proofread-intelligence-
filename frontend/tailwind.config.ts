@@ -40,6 +40,7 @@ const config: Config = {
         'spin-slow': 'spin 8s linear infinite',
         'pulse-glow': 'pulse-glow 2s cubic-bezier(0.4, 0, 0.6, 1) infinite',
         'float': 'float 6s ease-in-out infinite',
+        'proof-breathe': 'proof-breathe 3.2s ease-in-out infinite',
       },
       keyframes: {
         'pulse-glow': {
@@ -49,7 +50,11 @@ const config: Config = {
         'float': {
           '0%, 100%': { transform: 'translateY(0)' },
           '50%': { transform: 'translateY(-10px)' },
-        }
+        },
+        'proof-breathe': {
+          '0%, 100%': { transform: 'scale(0.97)', boxShadow: '0 12px 34px rgba(224, 94, 60, 0.28)' },
+          '50%': { transform: 'scale(1.04)', boxShadow: '0 18px 48px rgba(255, 138, 101, 0.46)' },
+        },
       }
     },
   },

@@ -27,6 +27,18 @@ const COLLAPSED_WIDTH = 68;
 const COLLAPSED_HEIGHT = 68;
 const PANEL_WIDTH = 374;
 const PANEL_HEIGHT = 540;
+const PROCESS_STEPS = ["Gathering live page context", "Reviewing issues and project memory", "Preparing a grounded response"];
+
+function dockPosition(): Point | null {
+  if (typeof document === "undefined") return null;
+  const dock = document.getElementById("proof-intelligence-dock");
+  if (!dock) return null;
+  const bounds = dock.getBoundingClientRect();
+  return {
+    x: bounds.left + (bounds.width - COLLAPSED_WIDTH) / 2,
+    y: bounds.top + (bounds.height - COLLAPSED_HEIGHT) / 2,
+  };
+}
 function clampPosition(point: Point, expanded: boolean, measured?: { width: number; height: number }): Point {
   const width = measured?.width || (expanded ? Math.min(PANEL_WIDTH, window.innerWidth - 24) : Math.min(COLLAPSED_WIDTH, window.innerWidth - 24));
   const height = measured?.height || (expanded ? Math.min(PANEL_HEIGHT, window.innerHeight - 24) : COLLAPSED_HEIGHT);
@@ -107,6 +119,9 @@ export function AgenticBot({ bookId, pageNumber, stage, projectTitle, activeIssu
   const [captureCurrent, setCaptureCurrent] = useState<Point | null>(null);
   const [busy, setBusy] = useState(false);
   const [historyLoading, setHistoryLoading] = useState(false);
+  const [docked, setDocked] = useState(true);
+  const [processingStep, setProcessingStep] = useState(0);
+  const [pageChanging, setPageChanging] = useState(false);
   const [error, setError] = useState("");
   const [position, setPosition] = useState<Point | null>(null);
   const dragRef = useRef<{ pointer: Point; origin: Point; moved: boolean; size: { width: number; height: number } } | null>(null);
@@ -115,14 +130,15 @@ export function AgenticBot({ bookId, pageNumber, stage, projectTitle, activeIssu
   const lastPdfSelectionRef = useRef("");
   const shellRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
+  const previousPageRef = useRef(pageNumber);
 
   useEffect(() => {
     if (typeof window === "undefined") return;
-    // Start with CSS right/bottom anchoring. Persisted pixel coordinates are
-    // deliberately not restored: browser zoom, sidebars and monitor changes
-    // can otherwise leave a valid-looking coordinate outside the real view.
-    setPosition(null);
-    setMounted(true);
+    const frame = window.requestAnimationFrame(() => {
+      setPosition(dockPosition());
+      setMounted(true);
+    });
+    return () => window.cancelAnimationFrame(frame);
   }, []);
 
   // A collapsed launcher can legally sit near the right or bottom edge. When
@@ -130,8 +146,9 @@ export function AgenticBot({ bookId, pageNumber, stage, projectTitle, activeIssu
   // outside the visible browser area.
   useLayoutEffect(() => {
     if (!mounted || typeof window === "undefined") return;
-    setPosition((current) => current ? clampPosition(current, expanded) : null);
-  }, [expanded, mounted]);
+    if (docked && !expanded) setPosition(dockPosition());
+    else setPosition((current) => current ? clampPosition(current, expanded) : null);
+  }, [expanded, mounted, docked]);
 
   useEffect(() => {
     setMessages([]);
@@ -143,7 +160,22 @@ export function AgenticBot({ bookId, pageNumber, stage, projectTitle, activeIssu
   useEffect(() => {
     setSelectedText("");
     lastPdfSelectionRef.current = "";
+    if (previousPageRef.current !== pageNumber) {
+      previousPageRef.current = pageNumber;
+      setPageChanging(true);
+      const timer = window.setTimeout(() => setPageChanging(false), 900);
+      return () => window.clearTimeout(timer);
+    }
   }, [pageNumber]);
+
+  useEffect(() => {
+    if (!busy) {
+      setProcessingStep(0);
+      return;
+    }
+    const timer = window.setInterval(() => setProcessingStep((current) => Math.min(current + 1, PROCESS_STEPS.length - 1)), 1200);
+    return () => window.clearInterval(timer);
+  }, [busy]);
 
   useEffect(() => {
     const rememberPdfSelection = () => {
@@ -173,14 +205,18 @@ export function AgenticBot({ bookId, pageNumber, stage, projectTitle, activeIssu
 
   useEffect(() => {
     const onResize = () => setPosition((current) => {
+      if (docked && !expanded) return dockPosition();
       const bounds = shellRef.current?.getBoundingClientRect();
       return current ? clampPosition(current, expanded, bounds) : null;
     });
     window.addEventListener("resize", onResize);
-    return () => window.removeEventListener("resize", onResize);
-  }, [expanded]);
+    const dock = document.getElementById("proof-intelligence-dock");
+    const observer = dock && typeof ResizeObserver !== "undefined" ? new ResizeObserver(onResize) : null;
+    if (dock) observer?.observe(dock);
+    return () => { window.removeEventListener("resize", onResize); observer?.disconnect(); };
+  }, [expanded, docked]);
 
-  if (!bookId || !mounted) return null;
+  if (!mounted) return null;
 
   const onDragStart = (event: React.PointerEvent) => {
     if (!(event.target as HTMLElement).closest("[data-agent-drag]")) return;
@@ -197,6 +233,7 @@ export function AgenticBot({ bookId, pageNumber, stage, projectTitle, activeIssu
     // Allow natural hand/trackpad jitter without turning a click into a drag.
     if (!dragRef.current.moved && Math.hypot(dx, dy) < 8) return;
     dragRef.current.moved = true;
+    if (docked) setDocked(false);
     setPosition(clampPosition({
       x: dragRef.current.origin.x + dx,
       y: dragRef.current.origin.y + dy,
@@ -206,7 +243,16 @@ export function AgenticBot({ bookId, pageNumber, stage, projectTitle, activeIssu
     const moved = dragRef.current?.moved;
     dragRef.current = null;
     const bounds = shellRef.current?.getBoundingClientRect();
-    setPosition((current) => current ? clampPosition(current, expanded, bounds) : null);
+    const dock = document.getElementById("proof-intelligence-dock")?.getBoundingClientRect();
+    const nearDock = !expanded && moved && bounds && dock
+      ? bounds.right > dock.left - 24 && bounds.left < dock.right + 24 && bounds.bottom > dock.top - 24 && bounds.top < dock.bottom + 24
+      : false;
+    if (nearDock) {
+      setDocked(true);
+      setPosition(dockPosition());
+    } else {
+      setPosition((current) => current ? clampPosition(current, expanded, bounds) : null);
+    }
     if (moved) {
       suppressClickRef.current = true;
       window.setTimeout(() => { suppressClickRef.current = false; }, 0);
@@ -234,9 +280,19 @@ export function AgenticBot({ bookId, pageNumber, stage, projectTitle, activeIssu
 
   const openAssistant = () => {
     if (suppressClickRef.current) return;
-    setPosition((current) => current ? clampPosition(current, true) : null);
+    if (docked) {
+      const dock = document.getElementById("proof-intelligence-dock")?.getBoundingClientRect();
+      setPosition(clampPosition({ x: (dock?.right || 64) + 14, y: Math.max(12, dock?.top || 24) }, true));
+    } else {
+      setPosition((current) => current ? clampPosition(current, true) : null);
+    }
     setExpanded(true);
     void loadConversation();
+  };
+
+  const closeAssistant = () => {
+    setExpanded(false);
+    if (docked) window.requestAnimationFrame(() => setPosition(dockPosition()));
   };
 
   const useCurrentSelection = () => {
@@ -282,6 +338,10 @@ export function AgenticBot({ bookId, pageNumber, stage, projectTitle, activeIssu
   const send = async () => {
     const message = input.trim();
     if (!message || busy) return;
+    if (!bookId) {
+      setError("Open or start a proofreading project so Proof Intelligence has live context.");
+      return;
+    }
     const optimistic: AgentMessage = { role: "user", content: message, pageNumber, hasCapture: Boolean(captureDataUrl) };
     setMessages((current) => [...current, optimistic]);
     setInput("");
@@ -312,7 +372,7 @@ export function AgenticBot({ bookId, pageNumber, stage, projectTitle, activeIssu
     <>
       {captureMode && (
         <div
-          className="fixed inset-0 cursor-crosshair bg-slate-950/10"
+          className="fixed inset-0 cursor-crosshair bg-orange-100/20 backdrop-blur-[1px]"
           style={{ zIndex: 2147483647 }}
           onPointerDown={(event) => { setCaptureStart({ x: event.clientX, y: event.clientY }); setCaptureCurrent({ x: event.clientX, y: event.clientY }); }}
           onPointerMove={(event) => captureStart && setCaptureCurrent({ x: event.clientX, y: event.clientY })}
@@ -321,7 +381,7 @@ export function AgenticBot({ bookId, pageNumber, stage, projectTitle, activeIssu
           tabIndex={0}
           autoFocus
         >
-          <div className="absolute top-5 left-1/2 -translate-x-1/2 bg-slate-900 text-white px-4 py-2 rounded-xl text-xs font-bold shadow-xl">
+          <div className="absolute left-1/2 top-5 -translate-x-1/2 rounded-full border border-orange-200 bg-white px-4 py-2 text-xs font-bold text-brand-700 shadow-xl shadow-orange-500/10">
             Drag over the visible PDF region · Esc to cancel
           </div>
           {captureStart && captureCurrent && (
@@ -350,7 +410,7 @@ export function AgenticBot({ bookId, pageNumber, stage, projectTitle, activeIssu
           <button
             data-agent-drag
             onClick={(event) => { if (event.detail === 0) openAssistant(); }}
-            className="group relative flex h-[68px] w-[68px] cursor-grab items-center justify-center rounded-full border-[3px] border-white bg-gradient-to-br from-orange-400 via-brand-500 to-brand-700 text-white shadow-[0_16px_42px_rgba(224,94,60,0.42)] ring-1 ring-orange-300/70 transition-[transform,box-shadow] duration-300 hover:scale-105 hover:shadow-[0_20px_52px_rgba(224,94,60,0.52)] focus-visible:outline-none focus-visible:ring-4 focus-visible:ring-orange-300 active:cursor-grabbing active:scale-100"
+            className={`group relative flex h-[68px] w-[68px] cursor-grab items-center justify-center rounded-full border-[3px] border-white bg-gradient-to-br from-orange-300 via-brand-500 to-brand-600 text-white ring-1 ring-orange-300/70 transition-[transform,box-shadow,filter] duration-300 hover:scale-105 hover:brightness-105 focus-visible:outline-none focus-visible:ring-4 focus-visible:ring-orange-300 active:cursor-grabbing active:scale-100 ${docked ? "animate-proof-breathe" : "shadow-[0_16px_42px_rgba(224,94,60,0.36)] hover:shadow-[0_20px_52px_rgba(224,94,60,0.48)]"}`}
             aria-label="Open Proof Intelligence; drag to move"
           >
             <span className="absolute inset-[-8px] -z-10 rounded-full bg-orange-400/20 blur-md transition group-hover:bg-orange-400/30" />
@@ -358,7 +418,7 @@ export function AgenticBot({ bookId, pageNumber, stage, projectTitle, activeIssu
             <Sparkles className="relative h-7 w-7 drop-shadow-sm" strokeWidth={2.25} />
             <span className="absolute right-0.5 top-0.5 h-3.5 w-3.5 rounded-full border-[3px] border-white bg-emerald-500 shadow-sm" />
             <span className="pointer-events-none absolute right-[76px] top-1/2 hidden -translate-y-1/2 whitespace-nowrap rounded-full border border-orange-100 bg-white/95 px-3 py-1.5 text-[10px] font-bold text-slate-700 shadow-lg backdrop-blur-md group-hover:block">
-              Proof Intelligence is ready
+              {bookId ? "Proof Intelligence is live" : "Proof Intelligence"}
             </span>
           </button>
         ) : (
@@ -382,26 +442,32 @@ export function AgenticBot({ bookId, pageNumber, stage, projectTitle, activeIssu
                 <span className="absolute -right-0.5 -top-0.5 h-3 w-3 rounded-full border-[2.5px] border-white bg-emerald-500" />
               </div>
               <div className="min-w-0 flex-1">
-                <p className="text-[13px] font-black tracking-[-0.01em] text-slate-900">Proof Intelligence</p>
-                <p className="truncate text-[10px] font-medium text-slate-500"><span className="text-emerald-600">Live</span> · Reading page {pageNumber} with you</p>
+                <p className="text-[13px] font-black tracking-[-0.01em] text-slate-800">Proof Intelligence</p>
+                <p className="truncate text-[10px] font-medium text-slate-500">{bookId ? <><span className="text-emerald-600">Live</span> · Reading page {pageNumber} with you</> : <span className="text-orange-500">Waiting for a project</span>}</p>
               </div>
               <GripHorizontal className="h-4 w-4 text-orange-300" />
-              <button onPointerDown={(e) => e.stopPropagation()} onClick={() => setExpanded(false)} className="rounded-full border border-orange-100 bg-white p-2 text-slate-500 shadow-sm transition hover:border-orange-200 hover:bg-orange-50 hover:text-brand-600" aria-label="Let companion rest"><ChevronDown className="h-4 w-4" /></button>
+              <button onPointerDown={(e) => e.stopPropagation()} onClick={closeAssistant} className="rounded-full border border-orange-100 bg-white p-2 text-slate-500 shadow-sm transition-all duration-300 hover:-translate-y-0.5 hover:border-orange-300 hover:bg-orange-50 hover:text-brand-600" aria-label="Let companion rest"><ChevronDown className="h-4 w-4" /></button>
             </header>
 
             <div ref={scrollRef} role="log" aria-live="polite" aria-relevant="additions" className="custom-scrollbar min-h-0 flex-1 space-y-4 overflow-y-auto overscroll-contain bg-gradient-to-b from-white to-orange-50/25 px-4 py-4">
+              {bookId && (
+                <div className={`flex items-center gap-2 rounded-xl border px-3 py-2 text-[10px] font-semibold transition-all duration-500 ${pageChanging ? "border-orange-300 bg-orange-50 text-brand-700 shadow-sm shadow-orange-500/10" : "border-orange-100 bg-white/80 text-slate-500"}`}>
+                  <span className={`flex h-6 w-6 items-center justify-center rounded-full ${pageChanging ? "bg-orange-500 text-white" : "bg-orange-100 text-brand-600"}`}>{pageChanging ? <Loader2 className="h-3 w-3 animate-spin" /> : pageNumber}</span>
+                  <span className="min-w-0 flex-1 truncate">{pageChanging ? `Loading page ${pageNumber} context…` : `Page ${pageNumber} active · text, issues and project memory ready`}</span>
+                </div>
+              )}
               {messages.length === 0 && (
                 <div className="pt-2">
                   <div className="mb-4 flex items-start gap-3">
                     <span className="mt-1 flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-orange-100 text-brand-600"><Sparkles className="h-3.5 w-3.5" /></span>
                     <div>
-                      <p className="text-[15px] font-black tracking-[-0.02em] text-slate-900">I&apos;m with you on this page.</p>
-                      <p className="mt-1 text-[11px] leading-relaxed text-slate-500">Point me to text, an issue, or a visual region. I&apos;ll respond from the live project evidence—not from assumptions.</p>
+                      <p className="text-[15px] font-black tracking-[-0.02em] text-slate-800">{bookId ? "I’m with you on this page." : "Ready when your project is."}</p>
+                      <p className="mt-1 text-[11px] leading-relaxed text-slate-500">{bookId ? "Point me to text, an issue, or a visual region. I’ll respond from the live project evidence—not from assumptions." : "Start or open a proofreading project and I’ll connect to its pages, issues, instructions and live session context."}</p>
                     </div>
                   </div>
                   <div className="grid grid-cols-2 gap-2">
                     {["Explain this flag", "Check consistency", "What am I looking at?", "Remember a rule"].map((prompt) => (
-                      <button key={prompt} onClick={() => setInput(prompt)} className="rounded-xl border border-orange-100 bg-white px-3 py-2 text-left text-[10px] font-bold text-slate-600 shadow-sm transition hover:border-orange-300 hover:bg-orange-50 hover:text-brand-700">{prompt}</button>
+                      <button key={prompt} disabled={!bookId} onClick={() => setInput(prompt)} className="rounded-xl border border-orange-100 bg-white px-3 py-2 text-left text-[10px] font-bold text-slate-600 shadow-sm transition-all duration-300 hover:-translate-y-0.5 hover:border-orange-300 hover:bg-orange-50 hover:text-brand-700 disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:translate-y-0">{prompt}</button>
                     ))}
                   </div>
                 </div>
@@ -409,33 +475,33 @@ export function AgenticBot({ bookId, pageNumber, stage, projectTitle, activeIssu
               {messages.map((message, index) => (
                 <div key={`${index}-${message.role}`} className={`border-t border-slate-100 pt-3 first:border-0 first:pt-0 ${message.role === "user" ? "" : ""}`}>
                   <div className={`mb-1.5 flex items-center gap-2 ${message.role === "user" ? "justify-end" : ""}`}>
-                  <span className={`mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-full text-[10px] font-black ${message.role === "user" ? "bg-slate-900 text-white" : "bg-orange-100 text-brand-600"}`}>
+                  <span className={`mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-full text-[10px] font-black ${message.role === "user" ? "bg-orange-50 text-brand-700 ring-1 ring-orange-200" : "bg-orange-100 text-brand-600"}`}>
                     {message.role === "user" ? "You".slice(0, 1) : <Sparkles className="h-3.5 w-3.5" />}
                   </span>
                     <span className="text-[9px] font-black uppercase tracking-[0.12em] text-slate-400">{message.role === "user" ? "You" : "Proof Intelligence"}</span>
                     {message.pageNumber && <span className="text-[9px] font-medium text-slate-300">Page {message.pageNumber}</span>}
                   </div>
-                  <div className={`break-words text-[12px] leading-relaxed ${message.role === "user" ? "ml-auto max-w-[88%] rounded-2xl rounded-tr-md bg-slate-900 px-3.5 py-2.5 text-white" : "pl-9 text-slate-700"}`}>
+                  <div className={`break-words text-[12px] leading-relaxed ${message.role === "user" ? "ml-auto max-w-[88%] rounded-2xl rounded-tr-md bg-gradient-to-br from-orange-400 to-brand-600 px-3.5 py-2.5 text-white shadow-sm shadow-orange-500/15" : "pl-9 text-slate-700"}`}>
                     {message.role === "user" ? message.content : <ResponseText content={message.content} />}
                     {message.hasCapture && <span className="mt-1 block text-[9px] opacity-60">Page region shared</span>}
                   </div>
                 </div>
               ))}
-              {(historyLoading || busy) && <div className="flex items-center gap-2.5 text-[11px] font-medium text-slate-500"><span className="flex h-7 w-7 items-center justify-center rounded-full bg-orange-100 text-brand-600"><Loader2 className="h-3.5 w-3.5 animate-spin" /></span>{busy ? "Looking at your live project…" : "Rejoining this conversation…"}</div>}
+              {(historyLoading || busy) && <div className="rounded-2xl border border-orange-100 bg-white p-3 shadow-sm"><div className="flex items-center gap-2.5 text-[11px] font-semibold text-slate-600"><span className="relative flex h-8 w-8 items-center justify-center rounded-full bg-orange-100 text-brand-600"><Loader2 className="h-4 w-4 animate-spin" /><span className="absolute inset-0 animate-ping rounded-full border border-orange-300/50" /></span>{busy ? PROCESS_STEPS[processingStep] : "Rejoining this conversation…"}</div>{busy && <div className="mt-2 flex gap-1 pl-10">{PROCESS_STEPS.map((_, index) => <span key={index} className={`h-1 flex-1 rounded-full transition-colors duration-500 ${index <= processingStep ? "bg-orange-400" : "bg-orange-100"}`} />)}</div>}</div>}
             </div>
 
             {(selectedText || captureDataUrl) && (
               <div className="px-3 pt-2 flex gap-2 bg-white">
                 {selectedText && <span className="min-w-0 flex-1 truncate rounded-lg border border-orange-200 bg-orange-50 px-2 py-1 text-[10px] font-semibold text-orange-800" title={selectedText}>Selected: “{selectedText}”</span>}
-                {captureDataUrl && <div className="relative h-12 w-16 rounded-lg overflow-hidden border border-brand-200"><img src={captureDataUrl} alt="Captured PDF region" className="h-full w-full object-cover" /><button onClick={() => setCaptureDataUrl("")} className="absolute top-0 right-0 bg-slate-900/70 text-white"><X className="h-3 w-3" /></button></div>}
+                {captureDataUrl && <div className="relative h-12 w-16 overflow-hidden rounded-lg border border-brand-200"><img src={captureDataUrl} alt="Captured PDF region" className="h-full w-full object-cover" /><button onClick={() => setCaptureDataUrl("")} className="absolute right-0 top-0 rounded-bl-md bg-brand-600/90 p-0.5 text-white transition hover:bg-brand-700"><X className="h-3 w-3" /></button></div>}
               </div>
             )}
             {error && <div className="mx-4 mt-2 rounded-xl border border-red-100 bg-red-50 px-3 py-2 text-[10px] font-medium text-red-600">{error}</div>}
 
             <div className="space-y-2.5 border-t border-orange-100/80 bg-white p-3.5">
               <div className="flex items-center gap-1.5">
-                <button onPointerDown={(event) => event.preventDefault()} onClick={useCurrentSelection} className="flex items-center gap-1.5 rounded-full border border-slate-200 px-2.5 py-1.5 text-[9px] font-bold text-slate-600 transition hover:border-orange-200 hover:bg-orange-50"><MousePointer2 className="h-3 w-3" /> Use highlighted text</button>
-                <button onClick={() => { setExpanded(false); setCaptureMode(true); setError(""); }} className="flex items-center gap-1.5 rounded-full border border-slate-200 px-2.5 py-1.5 text-[9px] font-bold text-slate-600 transition hover:border-orange-200 hover:bg-orange-50"><Camera className="h-3 w-3" /> Show a region</button>
+                <button disabled={!bookId} onPointerDown={(event) => event.preventDefault()} onClick={useCurrentSelection} className="flex items-center gap-1.5 rounded-full border border-slate-200 px-2.5 py-1.5 text-[9px] font-bold text-slate-600 transition-all duration-300 hover:-translate-y-0.5 hover:border-orange-200 hover:bg-orange-50 disabled:cursor-not-allowed disabled:opacity-40"><MousePointer2 className="h-3 w-3" /> Use highlighted text</button>
+                <button disabled={!bookId} onClick={() => { setExpanded(false); setCaptureMode(true); setError(""); }} className="flex items-center gap-1.5 rounded-full border border-slate-200 px-2.5 py-1.5 text-[9px] font-bold text-slate-600 transition-all duration-300 hover:-translate-y-0.5 hover:border-orange-200 hover:bg-orange-50 disabled:cursor-not-allowed disabled:opacity-40"><Camera className="h-3 w-3" /> Show a region</button>
                 {(selectedText || captureDataUrl) && <button onClick={() => { setSelectedText(""); setCaptureDataUrl(""); }} className="ml-auto p-1 text-slate-400 hover:text-red-500" title="Clear attachments"><Trash2 className="h-3 w-3" /></button>}
               </div>
               <div className="flex items-end gap-2 rounded-[20px] border border-slate-200 bg-slate-50/80 p-1.5 pl-3 shadow-inner transition focus-within:border-orange-300 focus-within:bg-white focus-within:ring-4 focus-within:ring-orange-100/60">
@@ -448,7 +514,7 @@ export function AgenticBot({ bookId, pageNumber, stage, projectTitle, activeIssu
                   maxLength={2400}
                   className="max-h-24 min-h-[38px] flex-1 resize-none bg-transparent py-2 text-xs text-slate-800 outline-none placeholder:text-slate-400"
                 />
-                <button disabled={busy || !input.trim()} onClick={() => void send()} className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-gradient-to-br from-orange-400 to-brand-600 text-white shadow-md shadow-orange-500/20 transition hover:scale-105 disabled:scale-100 disabled:bg-none disabled:bg-slate-200 disabled:shadow-none"><Send className="h-4 w-4" /></button>
+                <button disabled={busy || !input.trim() || !bookId} onClick={() => void send()} className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-gradient-to-br from-orange-400 to-brand-600 text-white shadow-md shadow-orange-500/20 transition-all duration-300 hover:scale-105 hover:shadow-lg hover:shadow-orange-500/25 disabled:scale-100 disabled:bg-none disabled:bg-orange-100 disabled:text-orange-300 disabled:shadow-none"><Send className="h-4 w-4" /></button>
               </div>
               <p className="text-center text-[8px] font-medium tracking-wide text-slate-400">No AI request is made until you open or ask</p>
             </div>
