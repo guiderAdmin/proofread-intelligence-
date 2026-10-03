@@ -27,8 +27,6 @@ const COLLAPSED_WIDTH = 176;
 const COLLAPSED_HEIGHT = 52;
 const PANEL_WIDTH = 390;
 const PANEL_HEIGHT = 590;
-const POSITION_STORAGE_KEY = "proofdesk_agent_position_v2";
-
 function clampPosition(point: Point, expanded: boolean): Point {
   const width = expanded ? Math.min(PANEL_WIDTH, window.innerWidth - 24) : Math.min(COLLAPSED_WIDTH, window.innerWidth - 24);
   const height = expanded ? Math.min(PANEL_HEIGHT, window.innerHeight - 24) : COLLAPSED_HEIGHT;
@@ -83,21 +81,16 @@ export function AgenticBot({ bookId, pageNumber, stage, projectTitle, activeIssu
   const [captureCurrent, setCaptureCurrent] = useState<Point | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
-  const [position, setPosition] = useState<Point>({ x: 12, y: 12 });
+  const [position, setPosition] = useState<Point | null>(null);
   const dragRef = useRef<{ pointer: Point; origin: Point } | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     if (typeof window === "undefined") return;
-    const stored = localStorage.getItem(POSITION_STORAGE_KEY);
-    // Start above the session status bar, clearly inside the viewport. The
-    // launcher remains freely draggable after this safe initial placement.
-    const fallback = {
-      x: Math.max(12, window.innerWidth - COLLAPSED_WIDTH - 28),
-      y: Math.max(12, window.innerHeight - COLLAPSED_HEIGHT - 82),
-    };
-    try { setPosition(clampPosition(stored ? JSON.parse(stored) : fallback, false)); }
-    catch { setPosition(clampPosition(fallback, false)); }
+    // Start with CSS right/bottom anchoring. Persisted pixel coordinates are
+    // deliberately not restored: browser zoom, sidebars and monitor changes
+    // can otherwise leave a valid-looking coordinate outside the real view.
+    setPosition(null);
     setMounted(true);
   }, []);
 
@@ -106,7 +99,7 @@ export function AgenticBot({ bookId, pageNumber, stage, projectTitle, activeIssu
   // outside the visible browser area.
   useLayoutEffect(() => {
     if (!mounted || typeof window === "undefined") return;
-    setPosition((current) => clampPosition(current, expanded));
+    setPosition((current) => current ? clampPosition(current, expanded) : null);
   }, [expanded, mounted]);
 
   useEffect(() => {
@@ -129,9 +122,7 @@ export function AgenticBot({ bookId, pageNumber, stage, projectTitle, activeIssu
 
   useEffect(() => {
     const onResize = () => setPosition((current) => {
-      const next = clampPosition(current, expanded);
-      localStorage.setItem(POSITION_STORAGE_KEY, JSON.stringify(next));
-      return next;
+      return current ? clampPosition(current, expanded) : null;
     });
     window.addEventListener("resize", onResize);
     return () => window.removeEventListener("resize", onResize);
@@ -141,7 +132,10 @@ export function AgenticBot({ bookId, pageNumber, stage, projectTitle, activeIssu
 
   const onDragStart = (event: React.PointerEvent) => {
     if (!(event.target as HTMLElement).closest("[data-agent-drag]")) return;
-    dragRef.current = { pointer: { x: event.clientX, y: event.clientY }, origin: position };
+    const bounds = event.currentTarget.getBoundingClientRect();
+    const origin = position || { x: bounds.left, y: bounds.top };
+    setPosition(origin);
+    dragRef.current = { pointer: { x: event.clientX, y: event.clientY }, origin };
     (event.currentTarget as HTMLElement).setPointerCapture(event.pointerId);
   };
   const onDragMove = (event: React.PointerEvent) => {
@@ -153,13 +147,11 @@ export function AgenticBot({ bookId, pageNumber, stage, projectTitle, activeIssu
   };
   const onDragEnd = () => {
     dragRef.current = null;
-    const next = clampPosition(position, expanded);
-    setPosition(next);
-    localStorage.setItem(POSITION_STORAGE_KEY, JSON.stringify(next));
+    setPosition((current) => current ? clampPosition(current, expanded) : null);
   };
 
   const openAssistant = () => {
-    setPosition((current) => clampPosition(current, true));
+    setPosition((current) => current ? clampPosition(current, true) : null);
     setExpanded(true);
   };
 
@@ -240,7 +232,7 @@ export function AgenticBot({ bookId, pageNumber, stage, projectTitle, activeIssu
     <>
       {captureMode && (
         <div
-          className="fixed inset-0 z-[9100] cursor-crosshair bg-slate-950/10"
+          className="fixed inset-0 z-[100001] cursor-crosshair bg-slate-950/10"
           onPointerDown={(event) => { setCaptureStart({ x: event.clientX, y: event.clientY }); setCaptureCurrent({ x: event.clientX, y: event.clientY }); }}
           onPointerMove={(event) => captureStart && setCaptureCurrent({ x: event.clientX, y: event.clientY })}
           onPointerUp={completeCapture}
@@ -261,8 +253,12 @@ export function AgenticBot({ bookId, pageNumber, stage, projectTitle, activeIssu
       )}
 
       <div
-        className={`fixed z-[9000] ${expanded ? "w-[390px] max-w-[calc(100vw-24px)]" : "w-[176px] max-w-[calc(100vw-24px)]"}`}
-        style={{ left: position.x, top: position.y }}
+        className={`fixed z-[100000] ${expanded ? "w-[390px] max-w-[calc(100vw-24px)]" : "w-[176px] max-w-[calc(100vw-24px)]"}`}
+        style={position
+          ? { left: position.x, top: position.y }
+          : expanded
+            ? { right: 20, bottom: 20 }
+            : { right: 24, bottom: 76 }}
         onPointerDown={onDragStart}
         onPointerMove={onDragMove}
         onPointerUp={onDragEnd}
@@ -273,27 +269,27 @@ export function AgenticBot({ bookId, pageNumber, stage, projectTitle, activeIssu
             data-agent-drag
             onDoubleClick={openAssistant}
             onClick={openAssistant}
-            className="h-[52px] w-[176px] max-w-full rounded-2xl bg-gradient-to-br from-slate-900 to-brand-700 text-white shadow-2xl shadow-slate-900/25 border border-white/20 flex items-center gap-2.5 px-3.5 cursor-grab active:cursor-grabbing hover:-translate-y-0.5 transition-transform"
+            className="h-[52px] w-[176px] max-w-full rounded-2xl bg-white text-slate-800 shadow-2xl shadow-orange-500/25 border-2 border-brand-500 flex items-center gap-2.5 px-3 cursor-grab active:cursor-grabbing hover:-translate-y-0.5 hover:shadow-orange-500/35 transition-all ring-4 ring-white/80"
             title="Open project assistant (drag to move)"
           >
-            <span className="relative flex h-8 w-8 shrink-0 items-center justify-center rounded-xl bg-white/12">
+            <span className="relative flex h-8 w-8 shrink-0 items-center justify-center rounded-xl bg-gradient-to-br from-orange-400 to-brand-600 text-white shadow-md shadow-orange-500/25">
               <MessageCircle className="h-5 w-5" />
-              <span className="absolute -right-0.5 -top-0.5 h-2.5 w-2.5 rounded-full border-2 border-slate-900 bg-emerald-400" />
+              <span className="absolute -right-0.5 -top-0.5 h-2.5 w-2.5 rounded-full border-2 border-white bg-emerald-500" />
             </span>
             <span className="min-w-0 text-left">
               <span className="block truncate text-xs font-black tracking-wide">Project assistant</span>
-              <span className="block truncate text-[9px] font-medium text-slate-300">Drag anywhere · Click to open</span>
+              <span className="block truncate text-[9px] font-semibold text-brand-600">Drag anywhere · Click to open</span>
             </span>
           </button>
         ) : (
-          <section className="h-[590px] max-h-[calc(100vh-24px)] rounded-2xl bg-white border border-slate-200 shadow-2xl overflow-hidden flex flex-col">
-            <header data-agent-drag className="h-14 shrink-0 px-3.5 bg-gradient-to-r from-slate-900 to-slate-800 text-white flex items-center gap-2.5 cursor-grab active:cursor-grabbing select-none">
-              <div className="h-8 w-8 rounded-xl bg-white/10 flex items-center justify-center"><Bot className="h-4.5 w-4.5" /></div>
+          <section className="h-[590px] max-h-[calc(100vh-24px)] rounded-2xl bg-white border-2 border-brand-400 shadow-2xl shadow-orange-500/20 overflow-hidden flex flex-col ring-4 ring-white/80">
+            <header data-agent-drag className="h-14 shrink-0 px-3.5 bg-gradient-to-r from-orange-500 to-brand-600 text-white flex items-center gap-2.5 cursor-grab active:cursor-grabbing select-none">
+              <div className="h-8 w-8 rounded-xl bg-white/20 border border-white/25 flex items-center justify-center"><Bot className="h-4.5 w-4.5" /></div>
               <div className="min-w-0 flex-1">
                 <p className="text-xs font-black tracking-wide">Project assistant</p>
                 <p className="text-[10px] text-slate-300 truncate">{projectTitle || "Live proofread"} · Page {pageNumber}</p>
               </div>
-              <GripHorizontal className="h-4 w-4 text-slate-500" />
+              <GripHorizontal className="h-4 w-4 text-orange-100" />
               <button onPointerDown={(e) => e.stopPropagation()} onClick={() => setExpanded(false)} className="p-1.5 hover:bg-white/10 rounded-lg" aria-label="Collapse assistant"><ChevronDown className="h-4 w-4" /></button>
             </header>
 
