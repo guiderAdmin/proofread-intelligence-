@@ -27,13 +27,39 @@ const COLLAPSED_WIDTH = 68;
 const COLLAPSED_HEIGHT = 68;
 const PANEL_WIDTH = 374;
 const PANEL_HEIGHT = 540;
-function clampPosition(point: Point, expanded: boolean): Point {
-  const width = expanded ? Math.min(PANEL_WIDTH, window.innerWidth - 24) : Math.min(COLLAPSED_WIDTH, window.innerWidth - 24);
-  const height = expanded ? Math.min(PANEL_HEIGHT, window.innerHeight - 24) : COLLAPSED_HEIGHT;
+function clampPosition(point: Point, expanded: boolean, measured?: { width: number; height: number }): Point {
+  const width = measured?.width || (expanded ? Math.min(PANEL_WIDTH, window.innerWidth - 24) : Math.min(COLLAPSED_WIDTH, window.innerWidth - 24));
+  const height = measured?.height || (expanded ? Math.min(PANEL_HEIGHT, window.innerHeight - 24) : COLLAPSED_HEIGHT);
   return {
     x: Math.max(12, Math.min(window.innerWidth - width - 12, point.x)),
     y: Math.max(12, Math.min(window.innerHeight - height - 12, point.y)),
   };
+}
+
+function readableLine(value: string) {
+  return value
+    .replace(/^#{1,6}\s*/, "")
+    .replace(/\*\*([^*]+)\*\*/g, "$1")
+    .replace(/__([^_]+)__/g, "$1")
+    .replace(/`([^`]+)`/g, "$1")
+    .trim();
+}
+
+function ResponseText({ content }: { content: string }) {
+  const lines = String(content || "").split(/\r?\n/);
+  return (
+    <div className="space-y-1.5">
+      {lines.map((raw, index) => {
+        const text = readableLine(raw);
+        if (!text || /^-{3,}$/.test(text)) return text ? null : <div key={index} className="h-1" />;
+        const bullet = text.match(/^[-*•]\s+(.+)$/);
+        if (bullet) return <div key={index} className="flex items-start gap-2"><span className="mt-[7px] h-1.5 w-1.5 shrink-0 rounded-full bg-orange-400" /><span>{bullet[1]}</span></div>;
+        const numbered = text.match(/^(\d+)[.)]\s+(.+)$/);
+        if (numbered) return <div key={index} className="flex items-start gap-2"><span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-orange-100 text-[9px] font-black text-brand-700">{numbered[1]}</span><span>{numbered[2]}</span></div>;
+        return <p key={index}>{text}</p>;
+      })}
+    </div>
+  );
 }
 
 function cropPdfCanvas(rect: CaptureRect): string | null {
@@ -83,9 +109,11 @@ export function AgenticBot({ bookId, pageNumber, stage, projectTitle, activeIssu
   const [historyLoading, setHistoryLoading] = useState(false);
   const [error, setError] = useState("");
   const [position, setPosition] = useState<Point | null>(null);
-  const dragRef = useRef<{ pointer: Point; origin: Point; moved: boolean } | null>(null);
+  const dragRef = useRef<{ pointer: Point; origin: Point; moved: boolean; size: { width: number; height: number } } | null>(null);
   const suppressClickRef = useRef(false);
   const loadedBookRef = useRef<string | null>(null);
+  const lastPdfSelectionRef = useRef("");
+  const shellRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -106,11 +134,38 @@ export function AgenticBot({ bookId, pageNumber, stage, projectTitle, activeIssu
   }, [expanded, mounted]);
 
   useEffect(() => {
-    if (!bookId) {
-      setMessages([]);
-      loadedBookRef.current = null;
-    }
+    setMessages([]);
+    setSelectedText("");
+    lastPdfSelectionRef.current = "";
+    loadedBookRef.current = null;
   }, [bookId]);
+
+  useEffect(() => {
+    setSelectedText("");
+    lastPdfSelectionRef.current = "";
+  }, [pageNumber]);
+
+  useEffect(() => {
+    const rememberPdfSelection = () => {
+      const selection = window.getSelection();
+      if (!selection || selection.isCollapsed || !selection.rangeCount) return;
+      const text = String(selection).replace(/\s+/g, " ").trim().slice(0, 2400);
+      if (!text) return;
+      const range = selection.getRangeAt(0);
+      const common = range.commonAncestorContainer.nodeType === Node.ELEMENT_NODE
+        ? range.commonAncestorContainer as Element
+        : range.commonAncestorContainer.parentElement;
+      const inTextLayer = Boolean(common?.closest(".react-pdf__Page__textLayer, .textLayer"));
+      const selectionBox = range.getBoundingClientRect();
+      const overlapsPdf = Array.from(document.querySelectorAll(".react-pdf__Page")).some((page) => {
+        const box = page.getBoundingClientRect();
+        return selectionBox.right > box.left && selectionBox.left < box.right && selectionBox.bottom > box.top && selectionBox.top < box.bottom;
+      });
+      if (inTextLayer || overlapsPdf) lastPdfSelectionRef.current = text;
+    };
+    document.addEventListener("selectionchange", rememberPdfSelection);
+    return () => document.removeEventListener("selectionchange", rememberPdfSelection);
+  }, []);
 
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
@@ -118,7 +173,8 @@ export function AgenticBot({ bookId, pageNumber, stage, projectTitle, activeIssu
 
   useEffect(() => {
     const onResize = () => setPosition((current) => {
-      return current ? clampPosition(current, expanded) : null;
+      const bounds = shellRef.current?.getBoundingClientRect();
+      return current ? clampPosition(current, expanded, bounds) : null;
     });
     window.addEventListener("resize", onResize);
     return () => window.removeEventListener("resize", onResize);
@@ -131,7 +187,7 @@ export function AgenticBot({ bookId, pageNumber, stage, projectTitle, activeIssu
     const bounds = event.currentTarget.getBoundingClientRect();
     const origin = position || { x: bounds.left, y: bounds.top };
     setPosition(origin);
-    dragRef.current = { pointer: { x: event.clientX, y: event.clientY }, origin, moved: false };
+    dragRef.current = { pointer: { x: event.clientX, y: event.clientY }, origin, moved: false, size: { width: bounds.width, height: bounds.height } };
     (event.currentTarget as HTMLElement).setPointerCapture(event.pointerId);
   };
   const onDragMove = (event: React.PointerEvent) => {
@@ -143,12 +199,13 @@ export function AgenticBot({ bookId, pageNumber, stage, projectTitle, activeIssu
     setPosition(clampPosition({
       x: dragRef.current.origin.x + dx,
       y: dragRef.current.origin.y + dy,
-    }, expanded));
+    }, expanded, dragRef.current.size));
   };
   const onDragEnd = () => {
     const moved = dragRef.current?.moved;
     dragRef.current = null;
-    setPosition((current) => current ? clampPosition(current, expanded) : null);
+    const bounds = shellRef.current?.getBoundingClientRect();
+    setPosition((current) => current ? clampPosition(current, expanded, bounds) : null);
     if (moved) {
       suppressClickRef.current = true;
       window.setTimeout(() => { suppressClickRef.current = false; }, 0);
@@ -181,14 +238,10 @@ export function AgenticBot({ bookId, pageNumber, stage, projectTitle, activeIssu
 
   const useCurrentSelection = () => {
     const selection = window.getSelection();
-    const text = String(selection || "").replace(/\s+/g, " ").trim().slice(0, 2400);
+    const liveText = String(selection || "").replace(/\s+/g, " ").trim().slice(0, 2400);
+    const text = liveText || lastPdfSelectionRef.current;
     if (!text) {
       setError("Select text on the PDF page first.");
-      return;
-    }
-    const anchor = selection?.anchorNode?.parentElement;
-    if (!anchor?.closest(".react-pdf__Page__textLayer")) {
-      setError("The selection must come from the open PDF page.");
       return;
     }
     setSelectedText(text);
@@ -278,7 +331,8 @@ export function AgenticBot({ bookId, pageNumber, stage, projectTitle, activeIssu
       )}
 
       <div
-        className={`fixed ${expanded ? "w-[374px] max-w-[calc(100vw-24px)]" : "h-[68px] w-[68px]"}`}
+        ref={shellRef}
+        className={`fixed ${expanded ? "w-auto" : "h-[68px] w-[68px]"}`}
         style={position
           ? { left: position.x, top: position.y, zIndex: 2147483646, touchAction: "none" }
           : expanded
@@ -294,27 +348,38 @@ export function AgenticBot({ bookId, pageNumber, stage, projectTitle, activeIssu
             data-agent-drag
             onClick={openAssistant}
             className="group relative flex h-[68px] w-[68px] cursor-grab items-center justify-center rounded-full border-[3px] border-white bg-gradient-to-br from-orange-400 via-brand-500 to-brand-700 text-white shadow-[0_16px_42px_rgba(224,94,60,0.42)] ring-1 ring-orange-300/70 transition-[transform,box-shadow] duration-300 hover:scale-105 hover:shadow-[0_20px_52px_rgba(224,94,60,0.52)] active:cursor-grabbing active:scale-100"
-            title="Your proofing companion — drag freely or click to talk"
-            aria-label="Open proofing companion; drag to move"
+            title="Proof Intelligence — drag freely or click to talk"
+            aria-label="Open Proof Intelligence; drag to move"
           >
             <span className="absolute inset-[-8px] -z-10 rounded-full bg-orange-400/20 blur-md transition group-hover:bg-orange-400/30" />
             <span className="absolute inset-[5px] rounded-full border border-white/25 bg-white/10" />
             <Sparkles className="relative h-7 w-7 drop-shadow-sm" strokeWidth={2.25} />
             <span className="absolute right-0.5 top-0.5 h-3.5 w-3.5 rounded-full border-[3px] border-white bg-emerald-500 shadow-sm" />
             <span className="pointer-events-none absolute right-[76px] top-1/2 hidden -translate-y-1/2 whitespace-nowrap rounded-full border border-orange-100 bg-white/95 px-3 py-1.5 text-[10px] font-bold text-slate-700 shadow-lg backdrop-blur-md group-hover:block">
-              I&apos;m here when you need me
+              Proof Intelligence is ready
             </span>
           </button>
         ) : (
-          <section className="flex h-[540px] max-h-[calc(100vh-24px)] flex-col overflow-hidden rounded-[28px] border border-orange-200/80 bg-white/95 shadow-[0_28px_80px_rgba(61,39,29,0.22),0_8px_24px_rgba(224,94,60,0.12)] ring-1 ring-white backdrop-blur-xl">
+          <section
+            className="flex flex-col overflow-hidden rounded-[26px] border border-orange-200/80 bg-white/95 shadow-[0_28px_80px_rgba(61,39,29,0.22),0_8px_24px_rgba(224,94,60,0.12)] ring-1 ring-white backdrop-blur-xl"
+            style={{
+              width: "min(340px, calc(100vw - 24px))",
+              height: "min(500px, calc(100vh - 24px))",
+              minWidth: 280,
+              minHeight: 340,
+              maxWidth: "min(680px, calc(100vw - 24px))",
+              maxHeight: "calc(100vh - 24px)",
+              resize: "both",
+            }}
+          >
             <header data-agent-drag className="flex h-[68px] shrink-0 cursor-grab select-none items-center gap-3 border-b border-orange-100/80 bg-gradient-to-r from-orange-50 via-white to-white px-4 active:cursor-grabbing">
               <div className="relative flex h-10 w-10 items-center justify-center rounded-full bg-gradient-to-br from-orange-400 to-brand-600 text-white shadow-lg shadow-orange-500/25">
                 <Sparkles className="h-5 w-5" />
                 <span className="absolute -right-0.5 -top-0.5 h-3 w-3 rounded-full border-[2.5px] border-white bg-emerald-500" />
               </div>
               <div className="min-w-0 flex-1">
-                <p className="text-[13px] font-black tracking-[-0.01em] text-slate-900">Your proofing companion</p>
-                <p className="truncate text-[10px] font-medium text-slate-500">Here with you on page {pageNumber} · {projectTitle || "Live proofread"}</p>
+                <p className="text-[13px] font-black tracking-[-0.01em] text-slate-900">Proof Intelligence</p>
+                <p className="truncate text-[10px] font-medium text-slate-500"><span className="text-emerald-600">Live</span> · Reading page {pageNumber} with you</p>
               </div>
               <GripHorizontal className="h-4 w-4 text-orange-300" />
               <button onPointerDown={(e) => e.stopPropagation()} onClick={() => setExpanded(false)} className="rounded-full border border-orange-100 bg-white p-2 text-slate-500 shadow-sm transition hover:border-orange-200 hover:bg-orange-50 hover:text-brand-600" aria-label="Let companion rest"><ChevronDown className="h-4 w-4" /></button>
@@ -326,8 +391,8 @@ export function AgenticBot({ bookId, pageNumber, stage, projectTitle, activeIssu
                   <div className="mb-4 flex items-start gap-3">
                     <span className="mt-1 flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-orange-100 text-brand-600"><Sparkles className="h-3.5 w-3.5" /></span>
                     <div>
-                      <p className="text-[15px] font-black tracking-[-0.02em] text-slate-900">What would you like to understand?</p>
-                      <p className="mt-1 text-[11px] leading-relaxed text-slate-500">I can look at this page, the active issue, selected text, or a captured region—only when you ask.</p>
+                      <p className="text-[15px] font-black tracking-[-0.02em] text-slate-900">I&apos;m with you on this page.</p>
+                      <p className="mt-1 text-[11px] leading-relaxed text-slate-500">Point me to text, an issue, or a visual region. I&apos;ll respond from the live project evidence—not from assumptions.</p>
                     </div>
                   </div>
                   <div className="grid grid-cols-2 gap-2">
@@ -338,12 +403,16 @@ export function AgenticBot({ bookId, pageNumber, stage, projectTitle, activeIssu
                 </div>
               )}
               {messages.map((message, index) => (
-                <div key={`${index}-${message.role}`} className={`flex items-start gap-2.5 ${message.role === "user" ? "flex-row-reverse" : ""}`}>
+                <div key={`${index}-${message.role}`} className={`border-t border-slate-100 pt-3 first:border-0 first:pt-0 ${message.role === "user" ? "" : ""}`}>
+                  <div className={`mb-1.5 flex items-center gap-2 ${message.role === "user" ? "justify-end" : ""}`}>
                   <span className={`mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-full text-[10px] font-black ${message.role === "user" ? "bg-slate-900 text-white" : "bg-orange-100 text-brand-600"}`}>
                     {message.role === "user" ? "You".slice(0, 1) : <Sparkles className="h-3.5 w-3.5" />}
                   </span>
-                  <div className={`max-w-[84%] text-[12px] leading-relaxed whitespace-pre-wrap ${message.role === "user" ? "rounded-2xl rounded-tr-md bg-slate-900 px-3.5 py-2.5 text-white" : "pt-1 text-slate-700"}`}>
-                    {message.content}
+                    <span className="text-[9px] font-black uppercase tracking-[0.12em] text-slate-400">{message.role === "user" ? "You" : "Proof Intelligence"}</span>
+                    {message.pageNumber && <span className="text-[9px] font-medium text-slate-300">Page {message.pageNumber}</span>}
+                  </div>
+                  <div className={`text-[12px] leading-relaxed ${message.role === "user" ? "ml-auto max-w-[88%] rounded-2xl rounded-tr-md bg-slate-900 px-3.5 py-2.5 text-white" : "pl-9 text-slate-700"}`}>
+                    {message.role === "user" ? message.content : <ResponseText content={message.content} />}
                     {message.hasCapture && <span className="mt-1 block text-[9px] opacity-60">Page region shared</span>}
                   </div>
                 </div>
@@ -353,7 +422,7 @@ export function AgenticBot({ bookId, pageNumber, stage, projectTitle, activeIssu
 
             {(selectedText || captureDataUrl) && (
               <div className="px-3 pt-2 flex gap-2 bg-white">
-                {selectedText && <span className="min-w-0 flex-1 truncate text-[10px] bg-amber-50 text-amber-800 border border-amber-200 rounded-lg px-2 py-1">Text: {selectedText}</span>}
+                {selectedText && <span className="min-w-0 flex-1 truncate rounded-lg border border-orange-200 bg-orange-50 px-2 py-1 text-[10px] font-semibold text-orange-800" title={selectedText}>Selected: “{selectedText}”</span>}
                 {captureDataUrl && <div className="relative h-12 w-16 rounded-lg overflow-hidden border border-brand-200"><img src={captureDataUrl} alt="Captured PDF region" className="h-full w-full object-cover" /><button onClick={() => setCaptureDataUrl("")} className="absolute top-0 right-0 bg-slate-900/70 text-white"><X className="h-3 w-3" /></button></div>}
               </div>
             )}
@@ -361,7 +430,7 @@ export function AgenticBot({ bookId, pageNumber, stage, projectTitle, activeIssu
 
             <div className="space-y-2.5 border-t border-orange-100/80 bg-white p-3.5">
               <div className="flex items-center gap-1.5">
-                <button onClick={useCurrentSelection} className="flex items-center gap-1.5 rounded-full border border-slate-200 px-2.5 py-1.5 text-[9px] font-bold text-slate-600 transition hover:border-orange-200 hover:bg-orange-50"><MousePointer2 className="h-3 w-3" /> Selected text</button>
+                <button onPointerDown={(event) => event.preventDefault()} onClick={useCurrentSelection} className="flex items-center gap-1.5 rounded-full border border-slate-200 px-2.5 py-1.5 text-[9px] font-bold text-slate-600 transition hover:border-orange-200 hover:bg-orange-50"><MousePointer2 className="h-3 w-3" /> Use highlighted text</button>
                 <button onClick={() => { setExpanded(false); setCaptureMode(true); setError(""); }} className="flex items-center gap-1.5 rounded-full border border-slate-200 px-2.5 py-1.5 text-[9px] font-bold text-slate-600 transition hover:border-orange-200 hover:bg-orange-50"><Camera className="h-3 w-3" /> Show a region</button>
                 {(selectedText || captureDataUrl) && <button onClick={() => { setSelectedText(""); setCaptureDataUrl(""); }} className="ml-auto p-1 text-slate-400 hover:text-red-500" title="Clear attachments"><Trash2 className="h-3 w-3" /></button>}
               </div>
@@ -370,7 +439,7 @@ export function AgenticBot({ bookId, pageNumber, stage, projectTitle, activeIssu
                   value={input}
                   onChange={(event) => setInput(event.target.value)}
                   onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void send(); } }}
-                  placeholder="Tell me what you want to understand…"
+                  placeholder="Talk to Proof Intelligence…"
                   rows={1}
                   maxLength={2400}
                   className="max-h-24 min-h-[38px] flex-1 resize-none bg-transparent py-2 text-xs text-slate-800 outline-none placeholder:text-slate-400"
