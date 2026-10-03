@@ -232,7 +232,8 @@ export function AgenticBot({ bookId, pageNumber, stage, projectTitle, activeIssu
     <>
       {captureMode && (
         <div
-          className="fixed inset-0 z-[100001] cursor-crosshair bg-slate-950/10"
+          className="fixed inset-0 cursor-crosshair bg-slate-950/10"
+          style={{ zIndex: 2147483647 }}
           onPointerDown={(event) => { setCaptureStart({ x: event.clientX, y: event.clientY }); setCaptureCurrent({ x: event.clientX, y: event.clientY }); }}
           onPointerMove={(event) => captureStart && setCaptureCurrent({ x: event.clientX, y: event.clientY })}
           onPointerUp={completeCapture}
@@ -253,12 +254,12 @@ export function AgenticBot({ bookId, pageNumber, stage, projectTitle, activeIssu
       )}
 
       <div
-        className={`fixed z-[100000] ${expanded ? "w-[390px] max-w-[calc(100vw-24px)]" : "w-[176px] max-w-[calc(100vw-24px)]"}`}
+        className={`fixed ${expanded ? "w-[390px] max-w-[calc(100vw-24px)]" : "w-[176px] max-w-[calc(100vw-24px)]"}`}
         style={position
-          ? { left: position.x, top: position.y }
+          ? { left: position.x, top: position.y, zIndex: 2147483646 }
           : expanded
-            ? { right: 20, bottom: 20 }
-            : { right: 24, bottom: 76 }}
+            ? { right: 20, bottom: 20, zIndex: 2147483646 }
+            : { right: 24, bottom: 76, zIndex: 2147483646 }}
         onPointerDown={onDragStart}
         onPointerMove={onDragMove}
         onPointerUp={onDragEnd}
