@@ -68,10 +68,7 @@ export function PagesPreview({
   React.useEffect(() => {
     if (typeof window !== "undefined") {
       import("react-pdf").then(({ pdfjs }) => {
-        pdfjs.GlobalWorkerOptions.workerSrc = new URL(
-          "pdfjs-dist/build/pdf.worker.min.js",
-          import.meta.url,
-        ).toString();
+        pdfjs.GlobalWorkerOptions.workerSrc = "/pdf.worker.min.js";
       });
     }
   }, []);

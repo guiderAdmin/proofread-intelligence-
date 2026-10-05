@@ -2,6 +2,7 @@
 @tailwind components;
 @tailwind utilities;
 
+@import "react-pdf/dist/esm/Page/TextLayer.css";
 :root {
   --background: #F8FAFC; /* Slate 50 */
   --foreground: #0f172a; /* Slate 900 */

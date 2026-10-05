@@ -29,11 +29,11 @@ import IssueList from "./IssueList";
 import LeaderLine from "./LeaderLine";
 
 import { Document, Page, pdfjs } from "react-pdf";
-import "react-pdf/dist/esm/Page/TextLayer.css";
+
 
 // Configure PDFjs worker for client-side parsing
 if (typeof window !== "undefined") {
-  pdfjs.GlobalWorkerOptions.workerSrc = `https://unpkg.com/pdfjs-dist@${pdfjs.version}/build/pdf.worker.min.js`;
+  pdfjs.GlobalWorkerOptions.workerSrc = "/pdf.worker.min.js";
 }
 
 interface ReviewStageProps {
