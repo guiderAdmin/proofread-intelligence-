@@ -24,23 +24,20 @@ interface UploadStageProps {
     rawFile?: File;
   } | null;
   onFileSelect: (file: File) => void;
-  onStartAnalysis: (scanTypes: string[], classLevel: string, subject: string, language: string, delaySeconds: number, instructions: string) => void;
+  onStartAnalysis: (scanTypes: string[], classLevel: string, subject: string, language: string, instructions: string) => void;
   savedBooks?: SavedBookSummary[];
   savedBooksLoading?: boolean;
   onOpenSaved?: (book: SavedBookSummary) => void;
   onDeleteSaved?: (bookId: string) => void;
+  onFileNameChange?: (newName: string) => void;
 }
 
-export function UploadStage({ selectedFile, onFileSelect, onStartAnalysis, savedBooks = [], savedBooksLoading = false, onOpenSaved, onDeleteSaved }: UploadStageProps) {
+export function UploadStage({ selectedFile, onFileSelect, onStartAnalysis, savedBooks = [], savedBooksLoading = false, onOpenSaved, onDeleteSaved, onFileNameChange }: UploadStageProps) {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [showModal, setShowModal] = useState(false);
-  // Keep setupStep for compatibility but modal replaces the inline card
-  const [setupStep, setSetupStep] = useState<"projects" | "preferences" | "document">("projects");
-  
   const [classLevel, setClassLevel] = useState<string>("");
   const [subject, setSubject] = useState<string>("");
   const [language, setLanguage] = useState<string>("");
-  const [delaySeconds, setDelaySeconds] = useState<number>(0);
   const [instructions, setInstructions] = useState<string>("");
   const [fileError, setFileError] = useState<string>("");
   const [isDragOver, setIsDragOver] = useState(false);
@@ -79,12 +76,10 @@ export function UploadStage({ selectedFile, onFileSelect, onStartAnalysis, saved
 
   const openModal = () => {
     setShowModal(true);
-    setSetupStep("preferences");
   };
 
   const closeModal = () => {
     setShowModal(false);
-    setSetupStep("projects");
   };
 
   return (
@@ -313,9 +308,20 @@ export function UploadStage({ selectedFile, onFileSelect, onStartAnalysis, saved
                   <div className="w-12 h-12 mx-auto mb-3 bg-emerald-50 border border-emerald-200/80 rounded-xl flex items-center justify-center">
                     <FileIcon className="h-5 w-5 text-emerald-600" />
                   </div>
-                  <p className="text-sm font-bold text-stone-800 truncate max-w-xs">{selectedFile.name}</p>
-                  <p className="text-xs text-stone-400 mt-1 mb-3">{selectedFile.size}</p>
-                  <span className="text-xs font-semibold text-stone-500 underline underline-offset-2 decoration-stone-300">Replace file</span>
+                  <div className="flex items-center justify-center gap-1.5 mb-1 group/edit">
+                    <input
+                      type="text"
+                      value={selectedFile.name}
+                      onChange={(e) => onFileNameChange?.(e.target.value)}
+                      onClick={(e) => e.stopPropagation()}
+                      className="text-sm font-bold text-stone-800 bg-transparent border-b-2 border-transparent hover:border-emerald-200 focus:border-emerald-500 focus:bg-white text-center truncate max-w-[200px] sm:max-w-xs px-2 py-0.5 transition-all outline-none rounded-t-md cursor-text"
+                      title="Click to rename project"
+                      placeholder="Project Name"
+                    />
+                    <svg className="w-3.5 h-3.5 text-stone-300 opacity-0 group-hover/edit:opacity-100 transition-opacity pointer-events-none" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M17 3a2.828 2.828 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z"></path></svg>
+                  </div>
+                  <p className="text-[11px] font-medium text-stone-400 mb-3">{selectedFile.size}</p>
+                  <span className="text-[11px] font-bold text-emerald-600 bg-emerald-50 hover:bg-emerald-100 px-3 py-1.5 rounded-full transition-colors border border-emerald-100/50 shadow-sm">Replace file</span>
                 </div>
               ) : (
                 <div className="text-center">
@@ -348,9 +354,11 @@ export function UploadStage({ selectedFile, onFileSelect, onStartAnalysis, saved
                   className="w-full appearance-none bg-white border border-stone-200 rounded-xl px-4 py-3 text-sm font-medium text-stone-800 focus:outline-none focus:border-stone-400 focus:ring-1 focus:ring-stone-400/20 transition-all cursor-pointer"
                 >
                   <option value="">Select Class Standard</option>
-                  <option>Nursery / Kindergarten</option>
+                  <option>Nursery</option>
+                  <option>LKG</option>
+                  <option>UKG</option>
                   {Array.from({ length: 12 }, (_, index) => <option key={index}>Class {index + 1}</option>)}
-                  <option>General audience</option>
+                  <option>General Proofread</option>
                 </select>
                 <ChevronDown className="h-4 w-4 text-stone-400 absolute right-3.5 top-1/2 -translate-y-1/2 pointer-events-none" />
               </div>
@@ -407,7 +415,7 @@ export function UploadStage({ selectedFile, onFileSelect, onStartAnalysis, saved
             {/* Start button */}
             <button
               onClick={() => {
-                onStartAnalysis(["grammar", "object", "fact"], classLevel, subject.trim(), language, delaySeconds, instructions.trim());
+                onStartAnalysis(["grammar", "object", "fact"], classLevel, subject.trim(), language, instructions.trim());
                 closeModal();
               }}
               disabled={!canStart}

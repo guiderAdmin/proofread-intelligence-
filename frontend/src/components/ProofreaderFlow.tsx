@@ -465,7 +465,7 @@ export default function ProofreaderFlow() {
   };
 
 
-  const startAnalysis = async (scanTypes: string[], classLevel: string, subject: string, language: string, activeDelay: number, instructions: string) => {
+  const startAnalysis = async (scanTypes: string[], classLevel: string, subject: string, language: string, instructions: string) => {
     if (!selectedFile?.rawFile) return;
 
     setActiveScanTypes(scanTypes);
@@ -554,13 +554,12 @@ export default function ProofreaderFlow() {
         body: JSON.stringify({
           pdfFilename,
           totalParts,
-          originalName: file.name,
-          title: file.name.replace(/\.pdf$/i, ""),
+          originalName: selectedFile.name || file.name,
+          title: (selectedFile.name || file.name).replace(/\.pdf$/i, ""),
           classLevel,
           subject,
           language: language.toLowerCase().includes("hindi") ? "hindi" : "english",
           bookType: "textbook",
-          delaySeconds: activeDelay.toString(),
           proofreadingInstructions: instructions,
         }),
       });
@@ -1400,6 +1399,7 @@ export default function ProofreaderFlow() {
                     >
                       <UploadStage
                         selectedFile={selectedFile} onFileSelect={handleFileSelect} onStartAnalysis={startAnalysis}
+                        onFileNameChange={(newName) => setSelectedFile(prev => prev ? { ...prev, name: newName } : null)}
                         savedBooks={savedBooks} savedBooksLoading={savedBooksLoading} onOpenSaved={openSavedBook}
                         onDeleteSaved={deleteSavedBook}
                       />

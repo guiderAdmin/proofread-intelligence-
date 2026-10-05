@@ -23,8 +23,8 @@ interface AgenticBotProps {
 type Point = { x: number; y: number };
 type CaptureRect = { left: number; top: number; width: number; height: number };
 
-const COLLAPSED_WIDTH = 68;
-const COLLAPSED_HEIGHT = 68;
+const COLLAPSED_WIDTH = 48;
+const COLLAPSED_HEIGHT = 48;
 const PANEL_WIDTH = 374;
 const PANEL_HEIGHT = 540;
 const PROCESS_STEPS = ["Gathering live page context", "Reviewing issues and project memory", "Preparing a grounded response"];
@@ -115,6 +115,7 @@ export function AgenticBot({ bookId, pageNumber, stage, projectTitle, activeIssu
   const [selectedText, setSelectedText] = useState("");
   const [captureDataUrl, setCaptureDataUrl] = useState("");
   const [captureMode, setCaptureMode] = useState(false);
+  const [isDetailed, setIsDetailed] = useState(false);
   const [captureStart, setCaptureStart] = useState<Point | null>(null);
   const [captureCurrent, setCaptureCurrent] = useState<Point | null>(null);
   const [busy, setBusy] = useState(false);
@@ -134,21 +135,42 @@ export function AgenticBot({ bookId, pageNumber, stage, projectTitle, activeIssu
 
   useEffect(() => {
     if (typeof window === "undefined") return;
-    const frame = window.requestAnimationFrame(() => {
-      setPosition(dockPosition());
-      setMounted(true);
-    });
-    return () => window.cancelAnimationFrame(frame);
+    setMounted(true);
+    let attempts = 0;
+    const findDockTimer = setInterval(() => {
+      const p = dockPosition();
+      if (p) {
+        setPosition(p);
+        clearInterval(findDockTimer);
+      } else if (attempts++ > 40) {
+        clearInterval(findDockTimer);
+      }
+    }, 50);
+    return () => clearInterval(findDockTimer);
   }, []);
 
-  // A collapsed launcher can legally sit near the right or bottom edge. When
-  // its 390px panel opens, re-clamp synchronously so it can never expand
-  // outside the visible browser area.
   useLayoutEffect(() => {
     if (!mounted || typeof window === "undefined") return;
-    if (docked && !expanded) setPosition(dockPosition());
+    if (docked && !expanded) {
+      const p = dockPosition();
+      if (p) setPosition(p);
+    }
     else setPosition((current) => current ? clampPosition(current, expanded) : null);
   }, [expanded, mounted, docked]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const handleResize = () => {
+      if (docked && !expanded) {
+        const p = dockPosition();
+        if (p) setPosition(p);
+      } else {
+        setPosition((current) => current ? clampPosition(current, expanded) : null);
+      }
+    };
+    window.addEventListener("resize", handleResize);
+    return () => window.removeEventListener("resize", handleResize);
+  }, [docked, expanded]);
 
   useEffect(() => {
     setMessages([]);
@@ -267,8 +289,13 @@ export function AgenticBot({ bookId, pageNumber, stage, projectTitle, activeIssu
     setHistoryLoading(true);
     try {
       const response = await fetch(`/api/agentic-bot?bookId=${encodeURIComponent(bookId)}`, { cache: "no-store" });
-      const payload = await response.json();
-      if (!response.ok) throw new Error(payload.error || "Could not load companion");
+      let payload: any = {};
+      try {
+        payload = await response.json();
+      } catch (e) {
+        if (!response.ok) throw new Error(`Server returned an invalid response (HTTP ${response.status}) - maybe a timeout?`);
+      }
+      if (!response.ok) throw new Error(payload?.error || "Could not load companion");
       setMessages(payload.messages || []);
     } catch (reason: any) {
       loadedBookRef.current = null;
@@ -351,10 +378,15 @@ export function AgenticBot({ bookId, pageNumber, stage, projectTitle, activeIssu
       const response = await fetch("/api/agentic-bot", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ bookId, pageNumber, message, selectedText, captureDataUrl, activeIssueUid, stage }),
+        body: JSON.stringify({ bookId, pageNumber, message, selectedText, captureDataUrl, activeIssueUid, stage, isDetailed }),
       });
-      const payload = await response.json();
-      if (!response.ok) throw new Error(payload.error || "Assistant request failed");
+      let payload: any = {};
+      try {
+        payload = await response.json();
+      } catch (e) {
+        if (!response.ok) throw new Error(`Server returned an invalid response (HTTP ${response.status}) - maybe a timeout?`);
+      }
+      if (!response.ok) throw new Error(payload?.error || "Assistant request failed");
       setMessages((current) => [...current, { role: "assistant", content: payload.answer, pageNumber }]);
       if (payload.action?.kind === "navigate" && Number.isInteger(payload.action.pageNumber)) {
         onNavigatePage?.(payload.action.pageNumber);
@@ -395,12 +427,12 @@ export function AgenticBot({ bookId, pageNumber, stage, projectTitle, activeIssu
 
       <div
         ref={shellRef}
-        className={`fixed ${expanded ? "w-auto" : "h-[68px] w-[68px]"}`}
+        className={`fixed ${expanded ? "w-auto" : "h-[48px] w-[48px]"}`}
         style={position
-          ? { left: position.x, top: position.y, zIndex: 2147483646, touchAction: "none" }
+          ? { left: position.x, top: position.y, zIndex: expanded ? 2147483646 : 60, touchAction: "none" }
           : expanded
             ? { right: 20, bottom: 20, zIndex: 2147483646, touchAction: "none" }
-            : { right: 24, bottom: 76, zIndex: 2147483646, touchAction: "none" }}
+            : { right: 24, bottom: 76, zIndex: 60, touchAction: "none", opacity: docked ? 0 : 1, pointerEvents: docked ? "none" : "auto" }}
         onPointerDown={onDragStart}
         onPointerMove={onDragMove}
         onPointerUp={onDragEnd}
@@ -410,20 +442,20 @@ export function AgenticBot({ bookId, pageNumber, stage, projectTitle, activeIssu
           <button
             data-agent-drag
             onClick={(event) => { if (event.detail === 0) openAssistant(); }}
-            className={`group relative flex h-[68px] w-[68px] cursor-grab items-center justify-center rounded-full border-[3px] border-white bg-gradient-to-br from-orange-300 via-brand-500 to-brand-600 text-white ring-1 ring-orange-300/70 transition-[transform,box-shadow,filter] duration-300 hover:scale-105 hover:brightness-105 focus-visible:outline-none focus-visible:ring-4 focus-visible:ring-orange-300 active:cursor-grabbing active:scale-100 ${docked ? "animate-proof-breathe" : "shadow-[0_16px_42px_rgba(224,94,60,0.36)] hover:shadow-[0_20px_52px_rgba(224,94,60,0.48)]"}`}
+            className={`group relative flex h-[48px] w-[48px] cursor-grab items-center justify-center rounded-full border-[2.5px] border-white bg-gradient-to-br from-orange-300 via-brand-500 to-brand-600 text-white ring-1 ring-orange-300/70 transition-[transform,box-shadow,filter] duration-300 hover:scale-105 hover:brightness-105 focus-visible:outline-none focus-visible:ring-4 focus-visible:ring-orange-300 active:cursor-grabbing active:scale-100 ${docked ? "animate-proof-breathe" : "shadow-[0_12px_32px_rgba(224,94,60,0.36)] hover:shadow-[0_16px_40px_rgba(224,94,60,0.48)]"}`}
             aria-label="Open Proof Intelligence; drag to move"
           >
-            <span className="absolute inset-[-8px] -z-10 rounded-full bg-orange-400/20 blur-md transition group-hover:bg-orange-400/30" />
-            <span className="absolute inset-[5px] rounded-full border border-white/25 bg-white/10" />
-            <Sparkles className="relative h-7 w-7 drop-shadow-sm" strokeWidth={2.25} />
-            <span className="absolute right-0.5 top-0.5 h-3.5 w-3.5 rounded-full border-[3px] border-white bg-emerald-500 shadow-sm" />
-            <span className="pointer-events-none absolute right-[76px] top-1/2 hidden -translate-y-1/2 whitespace-nowrap rounded-full border border-orange-100 bg-white/95 px-3 py-1.5 text-[10px] font-bold text-slate-700 shadow-lg backdrop-blur-md group-hover:block">
+            <span className="absolute inset-[-6px] -z-10 rounded-full bg-orange-400/20 blur-[5px] transition group-hover:bg-orange-400/30" />
+            <span className="absolute inset-[4px] rounded-full border border-white/25 bg-white/10" />
+            <Sparkles className="relative h-5 w-5 drop-shadow-sm" strokeWidth={2.25} />
+            <span className="absolute right-0 top-0 h-2.5 w-2.5 rounded-full border-2 border-white bg-emerald-500 shadow-sm" />
+            <span className="pointer-events-none absolute right-[56px] top-1/2 hidden -translate-y-1/2 whitespace-nowrap rounded-full border border-orange-100 bg-white/95 px-3 py-1.5 text-[10px] font-bold text-slate-700 shadow-lg backdrop-blur-md group-hover:block">
               {bookId ? "Proof Intelligence is live" : "Proof Intelligence"}
             </span>
           </button>
         ) : (
           <section
-            className="relative flex min-h-0 flex-col overflow-hidden rounded-[26px] border border-orange-200/80 bg-white/95 shadow-[0_28px_80px_rgba(61,39,29,0.22),0_8px_24px_rgba(224,94,60,0.12)] ring-1 ring-white backdrop-blur-xl"
+            className="relative flex min-h-0 flex-col overflow-hidden rounded-xl border border-orange-200/80 bg-white/95 shadow-[0_28px_80px_rgba(61,39,29,0.22),0_8px_24px_rgba(224,94,60,0.12)] ring-1 ring-white backdrop-blur-xl"
             role="dialog"
             aria-label="Proof Intelligence"
             style={{
@@ -442,8 +474,8 @@ export function AgenticBot({ bookId, pageNumber, stage, projectTitle, activeIssu
                 <span className="absolute -right-0.5 -top-0.5 h-3 w-3 rounded-full border-[2.5px] border-white bg-emerald-500" />
               </div>
               <div className="min-w-0 flex-1">
-                <p className="text-[13px] font-black tracking-[-0.01em] text-slate-800">Proof Intelligence</p>
-                <p className="truncate text-[10px] font-medium text-slate-500">{bookId ? <><span className="text-emerald-600">Live</span> · Reading page {pageNumber} with you</> : <span className="text-orange-500">Waiting for a project</span>}</p>
+                <p className="text-[14px] font-bold tracking-tight text-slate-900">SAGE Model</p>
+                <p className="text-[9.5px] leading-tight font-medium text-slate-500">{bookId ? <><span className="text-emerald-600">Live</span> · Strategic Analysis and Guided Explanation</> : <span className="text-orange-500">Strategic Analysis and Guided Explanation</span>}</p>
               </div>
               <GripHorizontal className="h-4 w-4 text-orange-300" />
               <button onPointerDown={(e) => e.stopPropagation()} onClick={closeAssistant} className="rounded-full border border-orange-100 bg-white p-2 text-slate-500 shadow-sm transition-all duration-300 hover:-translate-y-0.5 hover:border-orange-300 hover:bg-orange-50 hover:text-brand-600" aria-label="Let companion rest"><ChevronDown className="h-4 w-4" /></button>
@@ -473,18 +505,25 @@ export function AgenticBot({ bookId, pageNumber, stage, projectTitle, activeIssu
                 </div>
               )}
               {messages.map((message, index) => (
-                <div key={`${index}-${message.role}`} className={`border-t border-slate-100 pt-3 first:border-0 first:pt-0 ${message.role === "user" ? "" : ""}`}>
-                  <div className={`mb-1.5 flex items-center gap-2 ${message.role === "user" ? "justify-end" : ""}`}>
-                  <span className={`mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-full text-[10px] font-black ${message.role === "user" ? "bg-orange-50 text-brand-700 ring-1 ring-orange-200" : "bg-orange-100 text-brand-600"}`}>
-                    {message.role === "user" ? "You".slice(0, 1) : <Sparkles className="h-3.5 w-3.5" />}
-                  </span>
-                    <span className="text-[9px] font-black uppercase tracking-[0.12em] text-slate-400">{message.role === "user" ? "You" : "Proof Intelligence"}</span>
-                    {message.pageNumber && <span className="text-[9px] font-medium text-slate-300">Page {message.pageNumber}</span>}
-                  </div>
-                  <div className={`break-words text-[12px] leading-relaxed ${message.role === "user" ? "ml-auto max-w-[88%] rounded-2xl rounded-tr-md bg-gradient-to-br from-orange-400 to-brand-600 px-3.5 py-2.5 text-white shadow-sm shadow-orange-500/15" : "pl-9 text-slate-700"}`}>
+                <div key={`${index}-${message.role}`} className={`flex w-full flex-col ${message.role === "user" ? "items-end" : "items-start"}`}>
+                  {message.role === "assistant" && (
+                    <div className="mb-1.5 flex items-center gap-2">
+                      <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-[8px] bg-brand-50 text-brand-600 shadow-sm ring-1 ring-brand-200/50">
+                        <Sparkles className="h-3.5 w-3.5" />
+                      </span>
+                      <span className="text-[11px] font-bold text-slate-800">SAGE Model</span>
+                    </div>
+                  )}
+                  <div className={`break-words text-[12px] leading-relaxed ${message.role === "user" ? "max-w-[85%] rounded-2xl rounded-tr-[4px] bg-gradient-to-br from-orange-400 to-brand-600 px-3.5 py-2.5 text-white shadow-sm shadow-orange-500/15" : "w-full pl-8 text-slate-700"}`}>
                     {message.role === "user" ? message.content : <ResponseText content={message.content} />}
-                    {message.hasCapture && <span className="mt-1 block text-[9px] opacity-60">Page region shared</span>}
                   </div>
+                  {(message.hasCapture || (message.pageNumber && message.role === "user")) && (
+                    <div className={`mt-1.5 flex items-center gap-1.5 text-[9px] font-medium text-slate-400 ${message.role === "user" ? "pr-1" : "pl-8"}`}>
+                      {message.pageNumber && message.role === "user" && <span>Page {message.pageNumber}</span>}
+                      {message.hasCapture && message.pageNumber && message.role === "user" && <span>•</span>}
+                      {message.hasCapture && <span>Region attached</span>}
+                    </div>
+                  )}
                 </div>
               ))}
               {(historyLoading || busy) && <div className="rounded-2xl border border-orange-100 bg-white p-3 shadow-sm"><div className="flex items-center gap-2.5 text-[11px] font-semibold text-slate-600"><span className="relative flex h-8 w-8 items-center justify-center rounded-full bg-orange-100 text-brand-600"><Loader2 className="h-4 w-4 animate-spin" /><span className="absolute inset-0 animate-ping rounded-full border border-orange-300/50" /></span>{busy ? PROCESS_STEPS[processingStep] : "Rejoining this conversation…"}</div>{busy && <div className="mt-2 flex gap-1 pl-10">{PROCESS_STEPS.map((_, index) => <span key={index} className={`h-1 flex-1 rounded-full transition-colors duration-500 ${index <= processingStep ? "bg-orange-400" : "bg-orange-100"}`} />)}</div>}</div>}
@@ -498,25 +537,44 @@ export function AgenticBot({ bookId, pageNumber, stage, projectTitle, activeIssu
             )}
             {error && <div className="mx-4 mt-2 rounded-xl border border-red-100 bg-red-50 px-3 py-2 text-[10px] font-medium text-red-600">{error}</div>}
 
-            <div className="space-y-2.5 border-t border-orange-100/80 bg-white p-3.5">
-              <div className="flex items-center gap-1.5">
-                <button disabled={!bookId} onPointerDown={(event) => event.preventDefault()} onClick={useCurrentSelection} className="flex items-center gap-1.5 rounded-full border border-slate-200 px-2.5 py-1.5 text-[9px] font-bold text-slate-600 transition-all duration-300 hover:-translate-y-0.5 hover:border-orange-200 hover:bg-orange-50 disabled:cursor-not-allowed disabled:opacity-40"><MousePointer2 className="h-3 w-3" /> Use highlighted text</button>
-                <button disabled={!bookId} onClick={() => { setExpanded(false); setCaptureMode(true); setError(""); }} className="flex items-center gap-1.5 rounded-full border border-slate-200 px-2.5 py-1.5 text-[9px] font-bold text-slate-600 transition-all duration-300 hover:-translate-y-0.5 hover:border-orange-200 hover:bg-orange-50 disabled:cursor-not-allowed disabled:opacity-40"><Camera className="h-3 w-3" /> Show a region</button>
-                {(selectedText || captureDataUrl) && <button onClick={() => { setSelectedText(""); setCaptureDataUrl(""); }} className="ml-auto p-1 text-slate-400 hover:text-red-500" title="Clear attachments"><Trash2 className="h-3 w-3" /></button>}
-              </div>
-              <div className="flex items-end gap-2 rounded-[20px] border border-slate-200 bg-slate-50/80 p-1.5 pl-3 shadow-inner transition focus-within:border-orange-300 focus-within:bg-white focus-within:ring-4 focus-within:ring-orange-100/60">
+            <div className="border-t border-slate-100 bg-slate-50/60 p-3">
+              <div className="flex flex-col gap-2 rounded-2xl border border-slate-200 bg-white p-1.5 shadow-[0_2px_12px_rgba(0,0,0,0.03)] transition-all focus-within:border-brand-300 focus-within:ring-4 focus-within:ring-brand-100/50">
                 <textarea
                   value={input}
                   onChange={(event) => setInput(event.target.value)}
                   onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void send(); } }}
-                  placeholder="Talk to Proof Intelligence…"
+                  placeholder="Ask SAGE Model..."
                   rows={1}
                   maxLength={2400}
-                  className="max-h-24 min-h-[38px] flex-1 resize-none bg-transparent py-2 text-xs text-slate-800 outline-none placeholder:text-slate-400"
+                  className="custom-scrollbar max-h-32 min-h-[44px] w-full resize-none bg-transparent px-3 py-2.5 text-xs text-slate-800 outline-none placeholder:text-slate-400"
                 />
-                <button disabled={busy || !input.trim() || !bookId} onClick={() => void send()} className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-gradient-to-br from-orange-400 to-brand-600 text-white shadow-md shadow-orange-500/20 transition-all duration-300 hover:scale-105 hover:shadow-lg hover:shadow-orange-500/25 disabled:scale-100 disabled:bg-none disabled:bg-orange-100 disabled:text-orange-300 disabled:shadow-none"><Send className="h-4 w-4" /></button>
+                <div className="flex items-center justify-between px-1 pb-1">
+                  <div className="flex items-center gap-1">
+                    <button disabled={!bookId} onPointerDown={(event) => event.preventDefault()} onClick={useCurrentSelection} className="flex h-8 items-center gap-1.5 rounded-xl px-2.5 text-[10px] font-bold text-slate-500 transition-colors hover:bg-slate-100 hover:text-slate-800 disabled:opacity-40" title="Use highlighted text">
+                      <MousePointer2 className="h-3.5 w-3.5" /> <span className="hidden sm:inline">Text</span>
+                    </button>
+                    <button disabled={!bookId} onClick={() => { setExpanded(false); setCaptureMode(true); setError(""); }} className="flex h-8 items-center gap-1.5 rounded-xl px-2.5 text-[10px] font-bold text-slate-500 transition-colors hover:bg-slate-100 hover:text-slate-800 disabled:opacity-40" title="Capture region">
+                      <Camera className="h-3.5 w-3.5" /> <span className="hidden sm:inline">Region</span>
+                    </button>
+                    <div className="mx-1 h-4 w-px bg-slate-200"></div>
+                    <button onClick={() => setIsDetailed(!isDetailed)} className={`flex h-8 items-center gap-1.5 rounded-xl px-2.5 text-[10px] font-bold transition-colors ${isDetailed ? 'bg-brand-50 text-brand-700' : 'text-slate-500 hover:bg-slate-100 hover:text-slate-800'}`} title="Toggle detailed response">
+                      Detailed
+                      <span className={`flex h-3.5 w-6 items-center rounded-full p-0.5 transition-colors ${isDetailed ? 'justify-end bg-brand-500' : 'justify-start bg-slate-300'}`}>
+                        <span className="h-2.5 w-2.5 rounded-full bg-white shadow-sm" />
+                      </span>
+                    </button>
+                    {(selectedText || captureDataUrl) && (
+                      <button onClick={() => { setSelectedText(""); setCaptureDataUrl(""); }} className="ml-1 flex h-8 w-8 items-center justify-center rounded-xl text-red-400 transition-colors hover:bg-red-50 hover:text-red-600" title="Clear attachments">
+                        <Trash2 className="h-3.5 w-3.5" />
+                      </button>
+                    )}
+                  </div>
+                  <button disabled={busy || !input.trim() || !bookId} onClick={() => void send()} className="flex h-8 w-8 shrink-0 items-center justify-center rounded-xl bg-slate-900 text-white shadow-sm transition-all hover:scale-105 hover:bg-slate-800 disabled:scale-100 disabled:bg-slate-100 disabled:text-slate-400 disabled:shadow-none">
+                    <Send className="ml-0.5 h-3.5 w-3.5" />
+                  </button>
+                </div>
               </div>
-              <p className="text-center text-[8px] font-medium tracking-wide text-slate-400">No AI request is made until you open or ask</p>
+              <p className="mt-2.5 text-center text-[9px] font-semibold text-slate-400">SAGE Model AI • Mode: {isDetailed ? 'Comprehensive (8192)' : 'Concise (2048)'}</p>
             </div>
             <div className="pointer-events-none absolute bottom-1.5 right-1.5 h-3 w-3 border-b-2 border-r-2 border-orange-300/80" aria-hidden="true" />
           </section>
