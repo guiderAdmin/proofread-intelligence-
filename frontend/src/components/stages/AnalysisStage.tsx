@@ -7,6 +7,7 @@ interface AnalysisStageProps {
   progress: number;
   totalPages?: number;
   completedPages?: number;
+  indexedPages?: number;
   fileName?: string;
   fileSize?: string;
   selectedScanTypes?: string[];
@@ -30,6 +31,7 @@ export function AnalysisStage({
   progress,
   totalPages = 0,
   completedPages = 0,
+  indexedPages = 0,
   fileName = "document.pdf",
   fileSize = "0.0 MB",
   selectedScanTypes = ["grammar", "object", "fact"],
@@ -60,9 +62,9 @@ export function AnalysisStage({
       id: "ocr",
       title: "OCR & Vector Layout Parser",
       desc: "Decompressing PDF vector blocks, tables & font mappings...",
-      info: "PDF layout decoded. Vector boundaries mapped cleanly.",
+      info: "Page text and layout evidence saved for review.",
       icon: Cpu,
-      metric: "120 FPS • Layout Engine"
+      metric: "PDF text and OCR"
     }
   ];
 
@@ -71,9 +73,9 @@ export function AnalysisStage({
       id: "grammar",
       title: "Syntactic NLP & Readability Audit",
       desc: "Evaluating grade-level readability, grammar & syntax models...",
-      info: "Grammar audit complete. Syntactic compliance verified.",
+      info: "Language findings saved for review.",
       icon: Layers,
-      metric: "Grade 10 Standard • NLP"
+      metric: "Language checks"
     });
   }
 
@@ -82,9 +84,9 @@ export function AnalysisStage({
       id: "object",
       title: "Visual Asset Vision Pipeline",
       desc: "Extracting math equations, visual figures, and diagram captions...",
-      info: "Visual assets bounding-box scan completed successfully.",
+      info: "Visual findings saved. Verify any estimated locations during review.",
       icon: Eye,
-      metric: "Vision Model v4.2"
+      metric: "Visual checks"
     });
   }
 
@@ -92,10 +94,10 @@ export function AnalysisStage({
     dynamicSteps.push({
       id: "fact",
       title: "Pedagogical & Syllabus Validator",
-      desc: "Cross-referencing claims against state NCERT & CBSE guidelines...",
-      info: "Syllabus cross-referencing complete. Curriculum compliant.",
+      desc: "Reviewing factual claims and educational consistency...",
+      info: "Educational findings saved for review.",
       icon: BookOpen,
-      metric: "NCERT/CBSE Matrix"
+      metric: "Educational checks"
     });
   }
 
@@ -108,6 +110,13 @@ export function AnalysisStage({
 
   return (
     <div className="flex-grow flex flex-col justify-start w-full space-y-4 relative z-10 font-sans min-h-0 overflow-y-auto custom-scrollbar pr-1">
+
+      {!uploadPhase.active && totalPages > 0 && indexedPages < totalPages && completedPages === 0 && (
+        <div className="shrink-0 rounded-2xl border border-blue-200 bg-blue-50 p-4 text-sm text-blue-900">
+          Preparing chapter evidence: {indexedPages} / {totalPages} pages.
+          <p className="mt-1 text-xs">Page text is prepared before the single AI review so it can use the full chapter context.</p>
+        </div>
+      )}
 
       {/* Upload Phase Banner — shown while chunked upload is in progress */}
       {uploadPhase.active && (

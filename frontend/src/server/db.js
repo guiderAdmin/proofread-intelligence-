@@ -33,11 +33,14 @@ export async function connectDb() {
       .then((instance) => instance);
   }
 
+  const pending = cache.promise;
   try {
-    cache.connection = await cache.promise;
+    cache.connection = await pending;
     return cache.connection;
   } catch (error) {
-    cache.promise = null;
+    // A later caller may have begun a fresh reconnect after this attempt
+    // failed. Do not clear that newer connection promise from an older catch.
+    if (cache.promise === pending) cache.promise = null;
     throw error;
   }
 }

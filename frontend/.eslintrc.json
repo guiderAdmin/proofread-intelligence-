@@ -2,7 +2,7 @@
   "extends": ["next/core-web-vitals"],
   "overrides": [
     {
-      "files": ["src/server/**/*.js"],
+      "files": ["src/server/**/*.js", "feature/**/server/**/*.js"],
       "parser": "espree",
       "parserOptions": {
         "ecmaVersion": "latest",

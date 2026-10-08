@@ -106,7 +106,7 @@ export function UploadStage({ selectedFile, onFileSelect, onStartAnalysis, saved
               <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75" />
               <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500" />
             </span>
-            <span className="text-[10px] font-bold text-slate-600 uppercase tracking-wider">AI Engine Ready</span>
+            <span className="text-[10px] font-bold text-slate-600 uppercase tracking-wider">PDF Workspace</span>
           </div>
         </div>
 
@@ -375,9 +375,8 @@ export function UploadStage({ selectedFile, onFileSelect, onStartAnalysis, saved
                     onChange={(e) => setLanguage(e.target.value)}
                     className="w-full appearance-none bg-white border border-stone-200 rounded-xl px-4 py-3 text-sm font-medium text-stone-800 focus:outline-none focus:border-stone-400 focus:ring-1 focus:ring-stone-400/20 transition-all cursor-pointer"
                   >
-                    <option value="">Auto / mixed</option>
-                    <option>English (Indian / British)</option>
-                    <option>English (US)</option>
+                    <option value="" disabled>Select Language</option>
+                    <option>English</option>
                     <option>Hindi</option>
                   </select>
                   <ChevronDown className="h-4 w-4 text-stone-400 absolute right-3.5 top-1/2 -translate-y-1/2 pointer-events-none" />

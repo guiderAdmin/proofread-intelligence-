@@ -1,16 +1,15 @@
 import { NextResponse } from "next/server";
-import { assertSameOrigin, apiError, HttpError } from "@/server/http.js";
-import { deleteUploadObject } from "@/server/storage.js";
+import { assertSameOrigin, apiError, readJsonBody } from "@/server/http.js";
+import { deleteUploadObject, validateUploadKey, validatePdfParts } from "@/server/storage.js";
 
 export const runtime = "nodejs";
 
 export async function POST(request: Request) {
   try {
     assertSameOrigin(request);
-    const { filename, objectKey } = await request.json();
-    const key = String(objectKey || filename || "");
-    if (!key.startsWith("proofreader_assets/")) throw new HttpError(400, "Invalid temporary upload key");
-    await deleteUploadObject(key);
+    const { filename, objectKey, totalParts } = await readJsonBody(request);
+    const key = validateUploadKey(objectKey || filename || "");
+    await deleteUploadObject(key, validatePdfParts(totalParts ?? 1));
     return NextResponse.json({ success: true });
   } catch (error) {
     return apiError(error, "Unable to remove the temporary upload");

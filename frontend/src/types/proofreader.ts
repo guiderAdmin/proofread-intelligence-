@@ -19,7 +19,8 @@ export interface ProofreaderIssue {
     w: number;
     h: number;
   };
-  bboxSource?: "ai" | "pdf_text";
+  bboxSource?: "ai" | "pdf_text" | "ocr_text" | "unverified";
+  seenInLatestAnalysis?: boolean;
 }
 
 export interface CustomMark {

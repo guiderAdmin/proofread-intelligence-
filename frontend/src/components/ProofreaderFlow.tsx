@@ -28,6 +28,7 @@ const AppSidebar = dynamic(
 
 import { ProofreaderResponse, ProofreaderIssue, CustomMark, ProofreaderPageData } from "@/types/proofreader";
 import { locateIssuesInPdf } from "@/lib/pdf-text-locator";
+import { applyIssueGeometry, createSerialWriter, mergeIssueReviews } from "@/lib/review-state";
 import { AgenticBot } from "../../feature/agentic-bot";
 
 interface SavedBook {
@@ -41,6 +42,30 @@ interface SavedBook {
   createdAt?: string;
 }
 
+async function persistMarksSnapshot({ jobId, marks }: { jobId: string; marks: CustomMark[] }) {
+  const response = await fetch(`/api/books/${encodeURIComponent(jobId)}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ customMarks: marks }),
+  });
+  if (!response.ok) {
+    const payload = await response.json().catch(() => ({}));
+    throw new Error(payload?.error || "Could not save manual marks");
+  }
+}
+
+function readSession(key: string) {
+  try { return typeof window === "undefined" ? null : window.sessionStorage.getItem(key); }
+  catch { return null; }
+}
+
+function storeSession(key: string, value: string | null) {
+  try {
+    if (value === null) window.sessionStorage.removeItem(key);
+    else window.sessionStorage.setItem(key, value);
+  } catch { /* Browsers may disable session storage; durable server state still works. */ }
+}
+
 
 
 export default function ProofreaderFlow() {
@@ -48,25 +73,37 @@ export default function ProofreaderFlow() {
   useEffect(() => setIsClient(true), []);
 
   const [stage, setStage] = useState<"upload" | "analysis" | "dashboard" | "review" | "export">(() => {
-    if (typeof window !== "undefined") return (sessionStorage.getItem("pf_stage") as any) || "upload";
-    return "upload";
+    const saved = readSession("pf_stage");
+    return ["upload", "analysis", "dashboard", "review", "export"].includes(saved || "") ? saved as "upload" | "analysis" | "dashboard" | "review" | "export" : "upload";
   });
   const [isSidebarExpanded, setIsSidebarExpanded] = useState(true);
   const [sidebarActiveTab, setSidebarActiveTab] = useState<"proofreading" | "preview" | "settings">("proofreading");
   
   const [activePdfFilename, setActivePdfFilename] = useState<string | null>(null);
+  const uploadPartsRef = useRef(1);
 
   // Polling is backed by durable MongoDB state; UI correctness does not depend
   // on an in-memory realtime channel staying connected.
   const pollIntervalRef = useRef<NodeJS.Timeout | null>(null);
   const pollInFlightRef = useRef(false);
+  // Consecutive failed polls; polling only gives up after several in a row so a
+  // brief network blip / dev-server reload does not kill live updates.
+  const pollFailuresRef = useRef(0);
+  // Stable backend uid -> numeric id so the active issue survives re-polls.
+  const issueIdMapRef = useRef<Map<string, number>>(new Map());
   const marksLoadedRef = useRef(false);
 
   // Debounced marks-save refs – keeps the save serialised so rapid mark
   // additions never race against each other on the network.
   const marksSaveTimerRef = useRef<NodeJS.Timeout | null>(null);
-  const latestMarksRef = useRef<CustomMark[]>([]);
+  const pendingMarksSaveRef = useRef<{ jobId: string; marks: CustomMark[] } | null>(null);
+  const failedMarksSaveRef = useRef<{ jobId: string; marks: CustomMark[] } | null>(null);
+  const writeMarksRef = useRef(createSerialWriter(persistMarksSnapshot));
+  const marksWriteRef = useRef<Promise<void>>(Promise.resolve());
   const activeJobIdRef = useRef<string | null>(null);
+  const viewVersionRef = useRef(0);
+  const pendingStatusRef = useRef(new Map<string, "open" | "accepted" | "dismissed">());
+  const reviewVersionRef = useRef(0);
   // Set to true immediately before loading marks from DB; the save effect
   // consumes it once so we never write DB data straight back to MongoDB.
   const skipNextSaveRef = useRef(false);
@@ -89,41 +126,123 @@ export default function ProofreaderFlow() {
   useEffect(() => { selectedFileRef.current = selectedFile; }, [selectedFile]);
 
   const [activeJobId, setActiveJobId] = useState<string | null>(() => {
-    if (typeof window !== "undefined") return sessionStorage.getItem("pf_jobId");
-    return null;
+    return readSession("pf_jobId");
   });
   const [analysisStatus, setAnalysisStatus] = useState<"queued" | "processing" | "paused" | "done" | "error">("queued");
   const [uploadPhase, setUploadPhase] = useState<{ active: boolean; percent: number }>({ active: false, percent: 0 });
   const [progress, setProgress] = useState(0);
   const [totalPages, setTotalPages] = useState(0);
   const [completedPages, setCompletedPages] = useState(0);
+  const [indexedPages, setIndexedPages] = useState(0);
 
   const [responseData, setResponseData] = useState<ProofreaderResponse | null>(null);
   const [issues, setIssues] = useState<ProofreaderIssue[]>([]);
+  const latestIssuesRef = useRef(issues);
+  latestIssuesRef.current = issues;
   const [pages, setPages] = useState<ProofreaderPageData[]>([]);
   const [customMarks, setCustomMarks] = useState<CustomMark[]>([]);
   const [currentPage, setCurrentPage] = useState<number>(() => {
-    if (typeof window !== "undefined") {
-      const saved = sessionStorage.getItem("pf_page");
-      return saved ? parseInt(saved, 10) : 1;
-    }
-    return 1;
+    const saved = Number(readSession("pf_page"));
+    return Number.isSafeInteger(saved) && saved > 0 ? saved : 1;
   });
   const [activeIssueId, setActiveIssueId] = useState<number | null>(() => {
-    if (typeof window !== "undefined") {
-      const saved = sessionStorage.getItem("pf_issueId");
-      return saved ? parseInt(saved, 10) : null;
-    }
-    return null;
+    const saved = Number(readSession("pf_issueId"));
+    return Number.isSafeInteger(saved) && saved > 0 ? saved : null;
   });
   const [activeScanTypes, setActiveScanTypes] = useState<string[]>(["grammar", "object", "fact"]);
   const [showTerminateConfirm, setShowTerminateConfirm] = useState(false);
   const [globalError, setGlobalError] = useState<string | null>(null);
   useEffect(() => {
+    const viewVersion = viewVersionRef;
     return () => {
       if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
+      viewVersion.current++;
     };
   }, []);
+
+  // The function remains alive until one worker request completes. Status GETs stay read-only.
+  const workerRequestRef=useRef<Promise<void>|null>(null);
+  useEffect(()=>{
+    if(!activeJobId || !["queued","processing"].includes(analysisStatus))return;
+    let cancelled=false,timer:ReturnType<typeof setTimeout>;
+    const work=async()=>{
+      if(cancelled)return;
+      if(workerRequestRef.current) {timer=setTimeout(work,2000);return;}
+      const request=(async()=>{
+        try {
+          const response=await fetch("/api/worker",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({bookId:activeJobId})});
+          if(!response.ok && !cancelled) {
+            const payload=await response.json().catch(()=>({}));setGlobalError(payload.error||"Analysis worker is temporarily unavailable; saved findings are preserved.");
+          }
+        }catch(error:any){if(!cancelled)setGlobalError(error.message||"Analysis worker could not be reached.");}
+      })();
+      workerRequestRef.current=request;
+      try{await request;}finally{if(workerRequestRef.current===request)workerRequestRef.current=null;}
+      if(!cancelled)timer=setTimeout(work,2000);
+    };
+    void work();
+    return ()=>{cancelled=true;clearTimeout(timer);};
+  },[activeJobId,analysisStatus]);
+
+  // ── Live bbox grounding ────────────────────────────────────────────────
+  // Each poll returns raw backend issues (AI boxes). We cache the PDF-grounded
+  // boxes per issue so re-polls never wipe them, and only locate NEW issues.
+  const refinedBboxRef = useRef<Map<string, { bbox: any; bboxSource: any }>>(new Map());
+  const refineRunningRef = useRef(false);
+  const refineDirtyRef = useRef(false);
+
+  const issueKey = (i: any) => `${i.backendUid ?? i.id}|${i.page ?? i.pageIndex ?? ""}|${i.originalText ?? ""}|${i.lastDetectedAt ?? ""}|${i.textStart ?? ""}`;
+
+  const mergeRefined = (list: ProofreaderIssue[]): ProofreaderIssue[] =>
+    list.map((i) => {
+      const r = refinedBboxRef.current.get(issueKey(i));
+      if (i.bbox && ["pdf_text", "ocr_text"].includes(i.bboxSource || "")) {
+        refinedBboxRef.current.set(issueKey(i), { bbox: i.bbox, bboxSource: i.bboxSource }); return i;
+      }
+      return r?.bbox ? ({ ...i, bbox: r.bbox, bboxSource: r.bboxSource } as ProofreaderIssue) : i;
+    });
+
+  /** Ground any not-yet-located issues against the PDF text layer (serialised). */
+  const refineIssues = async (list: ProofreaderIssue[], fileOverride?: File | null) => {
+    const rawFile = fileOverride ?? selectedFileRef.current?.rawFile;
+    if (!rawFile) return;
+    if (refineRunningRef.current) { refineDirtyRef.current = true; return; }
+    const pending = list.filter((i) => !refinedBboxRef.current.has(issueKey(i)) && !["ocr_text", "pdf_text"].includes(i.bboxSource || ""));
+    if (!pending.length) return;
+    refineRunningRef.current = true;
+    const version = viewVersionRef.current;
+    try {
+      const refined = await locateIssuesInPdf(rawFile, pending);
+      if (version !== viewVersionRef.current) return;
+      refined.forEach((r: any) => {
+        refinedBboxRef.current.set(issueKey(r), { bbox: r.bbox, bboxSource: r.bboxSource });
+      });
+      setIssues((prev) => applyIssueGeometry(prev, refined as ProofreaderIssue[]));
+    } catch (err) {
+      console.error("[live-refine] failed", err);
+    } finally {
+      refineRunningRef.current = false;
+      if (refineDirtyRef.current) {
+        refineDirtyRef.current = false;
+        void refineIssues(latestIssuesRef.current, rawFile);
+      }
+    }
+  };
+
+  /** Push freshly polled issues to the UI instantly, keeping grounded boxes. */
+  const applyLiveIssues = (list: ProofreaderIssue[], fetchedReviewVersion?: number) => {
+    setIssues((current) => mergeRefined(mergeLiveIssues(list, current, fetchedReviewVersion)));
+    void refineIssues(list);
+  };
+
+  // When the PDF blob becomes available (e.g. after reopening a book), ground
+  // everything that is already on screen.
+  useEffect(() => {
+    if (selectedFile?.rawFile && latestIssuesRef.current.length) {
+      void refineIssues(latestIssuesRef.current, selectedFile.rawFile);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedFile?.rawFile]);
 
 
 
@@ -137,34 +256,73 @@ export default function ProofreaderFlow() {
   }, [stage]);
 
   useEffect(() => {
-    if (activeJobId) sessionStorage.setItem("pf_jobId", activeJobId);
-    else sessionStorage.removeItem("pf_jobId");
+    storeSession("pf_jobId", activeJobId);
   }, [activeJobId]);
 
   useEffect(() => {
-    sessionStorage.setItem("pf_stage", stage);
+    storeSession("pf_stage", stage);
   }, [stage]);
 
   useEffect(() => {
-    sessionStorage.setItem("pf_page", currentPage.toString());
+    storeSession("pf_page", currentPage.toString());
   }, [currentPage]);
 
   useEffect(() => {
-    if (activeIssueId) sessionStorage.setItem("pf_issueId", activeIssueId.toString());
-    else sessionStorage.removeItem("pf_issueId");
+    storeSession("pf_issueId", activeIssueId?.toString() || null);
   }, [activeIssueId]);
 
   // Keep stable refs so async callbacks always read current values
-  useEffect(() => { latestMarksRef.current = customMarks; }, [customMarks]);
   useEffect(() => { activeJobIdRef.current = activeJobId; }, [activeJobId]);
 
+  const saveMarks = (snapshot: { jobId: string; marks: CustomMark[] }) => {
+    const request = writeMarksRef.current(snapshot);
+    marksWriteRef.current = request;
+    void request.then(() => {
+      if (failedMarksSaveRef.current?.jobId === snapshot.jobId) failedMarksSaveRef.current = null;
+    }, () => { failedMarksSaveRef.current = snapshot; });
+    return request;
+  };
+
   /** Flush any pending debounced save immediately (call before reloading DB data) */
-  const flushMarksSave = () => {
+  const flushMarksSave = async () => {
     if (marksSaveTimerRef.current) {
       clearTimeout(marksSaveTimerRef.current);
       marksSaveTimerRef.current = null;
     }
+    const snapshot = pendingMarksSaveRef.current || failedMarksSaveRef.current;
+    pendingMarksSaveRef.current = null;
+    if (snapshot) saveMarks(snapshot);
+    await marksWriteRef.current;
   };
+
+  /**
+   * Write a still-pending debounced marks save right now instead of dropping
+   * it. keepalive lets the request finish even if the page is unloading.
+   */
+  const savePendingMarksNow = () => {
+    if (!marksSaveTimerRef.current) return;
+    clearTimeout(marksSaveTimerRef.current);
+    marksSaveTimerRef.current = null;
+    const snapshot = pendingMarksSaveRef.current || failedMarksSaveRef.current;
+    if (!snapshot) return;
+    const jobId = snapshot.jobId;
+    const body = JSON.stringify({ customMarks: snapshot.marks });
+    fetch(`/api/books/${encodeURIComponent(jobId)}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body,
+      // Browsers cap keepalive bodies at 64KB; larger payloads use a normal request.
+      keepalive: body.length < 60_000,
+    }).catch(() => {});
+  };
+
+  // Refresh / tab close: don't lose marks edited in the last debounce window.
+  useEffect(() => {
+    const onPageHide = () => savePendingMarksNow();
+    window.addEventListener("pagehide", onPageHide);
+    return () => window.removeEventListener("pagehide", onPageHide);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // Persist custom marks to DB whenever they change – debounced 400 ms so
   // rapid additions/deletions collapse into a single PATCH request, preventing
@@ -183,24 +341,15 @@ export default function ProofreaderFlow() {
     // Cancel any previously scheduled save
     if (marksSaveTimerRef.current) clearTimeout(marksSaveTimerRef.current);
 
-    marksSaveTimerRef.current = setTimeout(async () => {
+    // Capture the book and immutable array now, never from a later session.
+    pendingMarksSaveRef.current = { jobId: activeJobId, marks: customMarks };
+    marksSaveTimerRef.current = setTimeout(() => {
       marksSaveTimerRef.current = null;
-      const jobId = activeJobIdRef.current;
-      const marks = latestMarksRef.current;
-      if (!jobId) return;
-      try {
-        const res = await fetch(`/api/books/${encodeURIComponent(jobId)}`, {
-          method: "PATCH",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ customMarks: marks }),
-        });
-        if (!res.ok) {
-          const payload = await res.json().catch(() => ({}));
-          console.error("Failed to save custom marks to DB:", payload?.error || res.status);
-        }
-      } catch (err) {
-        console.error("Failed to save custom marks to DB", err);
-      }
+      const snapshot = pendingMarksSaveRef.current;
+      pendingMarksSaveRef.current = null;
+      if (!snapshot) return;
+      const request = saveMarks(snapshot);
+      void request.catch((error) => setGlobalError(error.message || "Could not save manual marks"));
     }, 400);
 
     return () => {
@@ -228,7 +377,11 @@ export default function ProofreaderFlow() {
   const refreshSavedBooks = async () => {
     try {
       const response = await fetch("/api/books", { cache: "no-store" });
-      if (response.ok) setSavedBooks(await response.json());
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload?.error || "Could not load saved proofreads");
+      setSavedBooks(Array.isArray(payload) ? payload : []);
+    } catch (error: any) {
+      setGlobalError(error.message || "Could not load saved proofreads");
     } finally {
       setSavedBooksLoading(false);
     }
@@ -270,29 +423,48 @@ export default function ProofreaderFlow() {
       ? rawSeverity
       : "medium";
     const box = issue.box;
-    const bbox = box ? {
-      x: Number(box.xmin || 0) / 10,
-      y: Number(box.ymin || 0) / 10,
-      w: Math.max(0.5, (Number(box.xmax || 1000) - Number(box.xmin || 0)) / 10),
-      h: Math.max(0.5, (Number(box.ymax || 1000) - Number(box.ymin || 0)) / 10),
+    const boxSource = issue.bboxSource ?? issue.boxSource;
+    const validBox = box && [box.xmin, box.ymin, box.xmax, box.ymax].every(Number.isFinite) &&
+      box.xmin >= 0 && box.ymin >= 0 && box.xmax <= 1000 && box.ymax <= 1000 && box.xmax > box.xmin && box.ymax > box.ymin;
+    const bbox = boxSource === "unverified" ? undefined : validBox ? {
+      x: box.xmin / 10, y: box.ymin / 10,
+      w: (box.xmax - box.xmin) / 10, h: (box.ymax - box.ymin) / 10,
     } : issue.bbox;
+    const categories: Record<string, string> = {
+      spelling: "Grammar", grammar: "Grammar", punctuation: "Grammar", wording: "Grammar", flow: "Grammar",
+      chapter_alignment: "Structure", unit_alignment: "Structure", heading: "Structure", learning_outcomes: "Pedagogy",
+      number: "Accuracy", page_number: "Accuracy", factual: "Accuracy", examples: "Accuracy",
+      image: "Formatting", alignment: "Formatting", layout: "Formatting", spacing: "Formatting", overflow: "Formatting",
+    };
+
+    const stableKey = issue.uid ? String(issue.uid) : null;
+    let stableId = idx + 1;
+    if (stableKey) {
+      const map = issueIdMapRef.current;
+      let existing = map.get(stableKey);
+      if (existing === undefined) {
+        existing = map.size + 1;
+        map.set(stableKey, existing);
+      }
+      stableId = existing;
+    }
 
     return {
       ...issue,
-      id: idx + 1,
+      id: stableId,
       backendUid: issue.uid,
       page: typeof pageNum === "number" ? pageNum : null,
       pageIndex: typeof pageIdx === "number" ? pageIdx : null,
       originalText: issue.originalText ?? issue.text ?? issue.original_text ?? issue.quote ?? "",
       suggestedText: issue.suggestedText ?? issue.suggested_text ?? issue.suggestion ?? "",
       explanation: issue.explanation ?? issue.reason ?? issue.why ?? "",
-      category: issue.category ?? issue.issueCategory ?? "General",
+      category: issue.category ?? issue.issueCategory ?? categories[issue.type] ?? "Style",
       type: issue.type ?? issue.issueType ?? issue.subtype ?? "Issue",
       severity,
       locationHint: issue.locationHint ?? issue.location ?? (pageNum ? `Page ${pageNum}` : ""),
       confidence: issue.confidence ?? 1.0,
       bbox,
-      bboxSource: issue.bboxSource ?? issue.boxSource,
+      bboxSource: boxSource,
       resolved: issue.status === "accepted" || issue.status === "fixed" || !!issue.resolved,
       ignored: issue.status === "dismissed" || !!issue.ignored,
     };
@@ -312,138 +484,167 @@ export default function ProofreaderFlow() {
       success: book.status === "done" && failed === 0,
       pagesReviewed: reviewed,
       pagesExpected: book.pageCount,
-      visualReviewPendingCount: failed,
+      visualReviewPendingCount: backendPages.filter((page: any) => page.status !== "done" || page.analysisWarnings?.length).length,
       issueCount: normalized.length,
-      printReady: book.status === "done" && failed === 0 && normalized.length === 0,
+      printReady: book.status === "done" && failed === 0 && normalized.length === 0 && backendPages.every((page: any) => !page.analysisWarnings?.length && page.coverage?.complete === true),
       severityCounts,
       issues: normalized,
       perPage: backendPages,
     };
   };
 
+  const mergeLiveIssues = (incoming: ProofreaderIssue[], current: ProofreaderIssue[], fetchedReviewVersion?: number) =>
+    mergeIssueReviews(incoming, current, pendingStatusRef.current,
+      fetchedReviewVersion !== undefined && fetchedReviewVersion < reviewVersionRef.current);
+  /** Poll a running/resumed job and stream its issues to the canvas live. */
+  const startLivePolling = (saved: SavedBook, isRestore = true) => {
+    const version = viewVersionRef.current;
+    if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
+    pollFailuresRef.current = 0;
+    pollInFlightRef.current = false;
+    pollIntervalRef.current = setInterval(async () => {
+      if (pollInFlightRef.current || version !== viewVersionRef.current) return;
+      pollInFlightRef.current = true;
+      try {
+        const fetchedReviewVersion = reviewVersionRef.current;
+        const response = await fetch(`/api/job?id=${encodeURIComponent(saved.id)}`, { cache: "no-store" });
+        let live: any = {};
+        try {
+          live = await response.json();
+        } catch (e) {
+          throw new Error(`Server returned an invalid response (HTTP ${response.status})`);
+        }
+        if (version !== viewVersionRef.current) return;
+        if (!response.ok) throw new Error(live?.error || "Could not refresh analysis");
+        if (!live?.book) throw new Error("Server returned no book data");
+        pollFailuresRef.current = 0;
+        const done = Number(live.book.progress?.done || 0);
+        const failed = Number(live.book.progress?.failed || 0);
+        const backendPages = live.pages || [];
+        const expected = Number(live.book.pageCount || backendPages.length || 0);
+
+        setAnalysisStatus(live.book.status);
+        setCompletedPages(done);
+        setIndexedPages(Number(live.book.progress?.indexed || 0));
+        setTotalPages(expected);
+        setProgress(expected ? Math.min(100, Math.round(((done + failed) / expected) * 100)) : 0);
+
+        if (done > 0 && live.book.status !== "done") {
+          setPages(backendPages.map((page: any) => ({
+            page_number: page.pageNumber,
+            image_url: page.imageUrl,
+          })));
+          const liveData = buildResponse(live.book, backendPages);
+          setResponseData(liveData);
+          applyLiveIssues(liveData.issues, fetchedReviewVersion);
+          if (!marksLoadedRef.current) {
+            marksLoadedRef.current = true;
+            setCustomMarks(live.book.customMarks || []);
+          }
+        }
+
+        if (["done", "error", "paused"].includes(live.book.status)) {
+          if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
+          await refreshSavedBooks();
+          if (version !== viewVersionRef.current) return;
+          if (live.book.status === "done") await openSavedBook({ ...saved, status: "done" }, isRestore);
+          else setGlobalError(live.book.error || (live.book.status === "paused" ? "Analysis paused" : "Analysis failed"));
+        }
+      } catch (error: any) {
+        if (version !== viewVersionRef.current) return;
+        pollFailuresRef.current += 1;
+        if (pollFailuresRef.current >= 5) {
+          if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
+          setGlobalError(error.message || "Could not refresh analysis");
+        }
+      } finally {
+        pollInFlightRef.current = false;
+      }
+    }, 2000);
+  };
+
   const openSavedBook = async (saved: SavedBook, isRestore = false) => {
+    const version = ++viewVersionRef.current;
+    const sameBook = activeJobIdRef.current === saved.id;
+    const marksAlreadyLoaded = sameBook && marksLoadedRef.current;
+    if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
     try {
       setGlobalError(null);
-      // Flush any pending debounced save so we don't race with the DB read below.
-      // The timer fires BEFORE we overwrite customMarks state with DB data.
-      flushMarksSave();
+      if (saved.id !== activeJobIdRef.current) refinedBboxRef.current.clear();
+      await flushMarksSave();
+      if (version !== viewVersionRef.current) return;
+      const fetchedReviewVersion = reviewVersionRef.current;
       const jobResponse = await fetch(`/api/books/${encodeURIComponent(saved.id)}`, { cache: "no-store" });
-      
-      let payload: any = {};
-      try {
-        payload = await jobResponse.json();
-      } catch (e) {
-        throw new Error(`Server returned an invalid response (HTTP ${jobResponse.status})`);
-      }
-      
+      const payload = await jobResponse.json();
+      if (version !== viewVersionRef.current) return;
       if (!jobResponse.ok) throw new Error(payload?.error || "Could not open this proofread");
-      
-      const backendPages = payload.pages || [];
-      const data = buildResponse(payload.book, backendPages);
-      let restoredIssues = data.issues;
-      data.issues = restoredIssues;
+      // The reader may add a mark while the GET is in flight. Save it before
+      // switching books; a same-book refresh keeps its newer local marks.
+      await flushMarksSave();
+      if (version !== viewVersionRef.current) return;
 
+      const backendPages = Array.isArray(payload.pages) ? payload.pages : [];
+      const data = buildResponse(payload.book, backendPages);
+      activeJobIdRef.current = saved.id;
       setActiveJobId(saved.id);
       setAnalysisStatus(payload.book.status);
-      
-      // Temporarily set selected file without the heavy rawFile blob
-      setSelectedFile({
+      const cachedFile = sameBook ? selectedFileRef.current?.rawFile : undefined;
+      if (!cachedFile) setSelectedFile({
         name: saved.originalName || `${saved.title}.pdf`, subject: saved.title,
-        size: "Loading...", pages: saved.pageCount, eta: "0s", rawFile: null as any,
+        size: "Loading...", pages: saved.pageCount, eta: "0s",
       });
-      
       setTotalPages(saved.pageCount);
       setCompletedPages(payload.book.progress?.done || 0);
+      setIndexedPages(Number(payload.book.progress?.indexed || 0));
       setProgress(saved.pageCount ? Math.round((((payload.book.progress?.done || 0) + (payload.book.progress?.failed || 0)) / saved.pageCount) * 100) : 0);
       setPages(backendPages.map((page: any) => ({ page_number: page.pageNumber, image_url: page.imageUrl })));
       setResponseData(data);
-      setIssues(restoredIssues);
-      setCurrentPage(1);
+      const restoredIssues = mergeLiveIssues(data.issues, sameBook ? latestIssuesRef.current : [], fetchedReviewVersion);
+      setIssues(mergeRefined(restoredIssues));
+      setCurrentPage((page) => isRestore ? Math.max(1, Math.min(saved.pageCount, page)) : 1);
 
-      // Asynchronously fetch the heavy PDF in the background so we don't block the UI
+      // Only apply geometry to still-current issues. A slow file fetch from an
+      // earlier book/reanalysis must not replace findings or review decisions.
+      if (cachedFile) {
+        void refineIssues(restoredIssues, cachedFile);
+      } else {
       setIsRefiningIssues(true);
-      fetch(`/api/books/${encodeURIComponent(saved.id)}/file`, { cache: "no-store" })
-        .then(async (fileResponse) => {
-          if (!fileResponse.ok) {
-            setIsRefiningIssues(false);
-            return;
-          }
+      void (async () => {
+        try {
+          const fileResponse = await fetch(`/api/books/${encodeURIComponent(saved.id)}/file`, { cache: "no-store" });
+          if (!fileResponse.ok) throw new Error("Could not load the PDF for review");
           const blob = await fileResponse.blob();
+          if (version !== viewVersionRef.current) return;
           const rawFile = new File([blob], saved.originalName || `${saved.title}.pdf`, { type: "application/pdf" });
-          
-          setSelectedFile(prev => prev ? { 
-            ...prev, 
-            size: `${(blob.size / 1024 / 1024).toFixed(1)} MB`, 
-            rawFile 
-          } : null);
+          setSelectedFile((current) => current ? { ...current, size: `${(blob.size / 1024 / 1024).toFixed(1)} MB`, rawFile } : null);
+          const located = await locateIssuesInPdf(rawFile, data.issues);
+          if (version === viewVersionRef.current) setIssues((current) => applyIssueGeometry(current, located as ProofreaderIssue[]));
+        } catch (error: any) {
+          if (version === viewVersionRef.current) setGlobalError(error.message || "Could not load PDF geometry");
+        } finally {
+          if (version === viewVersionRef.current) setIsRefiningIssues(false);
+        }
+      })();
+      }
 
-          // Refine bounding boxes in the background once the PDF is loaded
-          if (restoredIssues.length > 0) {
-            locateIssuesInPdf(rawFile, restoredIssues).then((refinedIssues) => {
-              setIssues(refinedIssues as ProofreaderIssue[]);
-              setIsRefiningIssues(false);
-            }).catch(() => {
-              setIsRefiningIssues(false);
-            });
-          } else {
-            setIsRefiningIssues(false);
-          }
-        })
-        .catch((error) => {
-          console.error(error);
-          setIsRefiningIssues(false);
-        });
-
-      // Load custom marks from DB.
-      // Set the one-shot skip flag so the save effect ignores this exact
-      // state update and avoids writing DB data straight back to MongoDB.
-      skipNextSaveRef.current = true;
-      marksLoadedRef.current = true;
-      setCustomMarks(payload.book.customMarks || []);
-
+      if (!marksAlreadyLoaded) {
+        skipNextSaveRef.current = true;
+        marksLoadedRef.current = true;
+        setCustomMarks(Array.isArray(payload.book.customMarks) ? payload.book.customMarks : []);
+      }
       if (!isRestore) {
         setActiveIssueId(restoredIssues[0]?.id || null);
         setStage(payload.book.status === "done" ? "dashboard" : "analysis");
       }
       setSidebarActiveTab("proofreading");
-      if (payload.book.status === "error") {
-        setGlobalError(payload.book.error || "Analysis stopped after the bounded retries were exhausted.");
+      if (payload.book.status === "error" || payload.book.status === "paused") {
+        setGlobalError(payload.book.error || "Analysis is paused. Resume it when the provider is available.");
       }
-      if (payload.book.status !== "done" && payload.book.status !== "error") {
-        if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
-        pollIntervalRef.current = setInterval(async () => {
-          if (pollInFlightRef.current) return;
-          pollInFlightRef.current = true;
-          try {
-            const response = await fetch(`/api/job?id=${encodeURIComponent(saved.id)}`, { cache: "no-store" });
-            let live: any = {};
-            try {
-              live = await response.json();
-            } catch (e) {
-              throw new Error(`Server returned an invalid response (HTTP ${response.status})`);
-            }
-            if (!response.ok) throw new Error(live?.error || "Could not refresh analysis");
-            const done = Number(live.book.progress?.done || 0);
-            const failed = Number(live.book.progress?.failed || 0);
-            setAnalysisStatus(live.book.status);
-            setCompletedPages(done);
-            setProgress(saved.pageCount ? Math.round(((done + failed) / saved.pageCount) * 100) : 0);
-            if (live.book.status === "done" || live.book.status === "error") {
-              if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
-              await refreshSavedBooks();
-              if (live.book.status === "done") await openSavedBook({ ...saved, status: "done" });
-              else setGlobalError(live.book.error || "Analysis failed");
-            }
-          } catch (error: any) {
-            if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
-            setGlobalError(error.message || "Could not refresh analysis");
-          } finally {
-            pollInFlightRef.current = false;
-          }
-        }, 2000);
+      if (["queued", "processing"].includes(payload.book.status)) {
+        startLivePolling(saved, isRestore);
       }
     } catch (error: any) {
-      setGlobalError(error.message || "Could not reopen this proofread");
+      if (version === viewVersionRef.current) setGlobalError(error.message || "Could not reopen this proofread");
     }
   };
 
@@ -455,8 +656,19 @@ export default function ProofreaderFlow() {
         throw new Error(payload?.error || "Could not delete this proofread");
       }
       if (activeJobId === bookId) {
+        viewVersionRef.current++;
+        if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
+        activeJobIdRef.current = null;
+        marksLoadedRef.current = false;
+        pendingMarksSaveRef.current = null;
+        failedMarksSaveRef.current = null;
+        marksWriteRef.current = Promise.resolve();
+        if (marksSaveTimerRef.current) clearTimeout(marksSaveTimerRef.current);
         setStage("upload");
         setActiveJobId(null);
+        setIssues([]);
+        setCustomMarks([]);
+        setSelectedFile(null);
       }
       await refreshSavedBooks();
     } catch (error: any) {
@@ -467,6 +679,17 @@ export default function ProofreaderFlow() {
 
   const startAnalysis = async (scanTypes: string[], classLevel: string, subject: string, language: string, instructions: string) => {
     if (!selectedFile?.rawFile) return;
+    const version = ++viewVersionRef.current;
+    try {
+      await flushMarksSave();
+    } catch (error: any) {
+      setGlobalError(error.message || "Could not save manual marks");
+      return;
+    }
+    if (version !== viewVersionRef.current) return;
+    marksLoadedRef.current = false;
+    activeJobIdRef.current = null;
+    setIsRefiningIssues(false);
 
     setActiveScanTypes(scanTypes);
     setGlobalError(null);
@@ -474,17 +697,21 @@ export default function ProofreaderFlow() {
     setActiveJobId(null);
     setResponseData(null);
     setIssues([]);
+    refinedBboxRef.current.clear();
     setPages([]);
     setCustomMarks([]);
     setCurrentPage(1);
     setActiveIssueId(null);
     setTotalPages(0);
     setCompletedPages(0);
+    setIndexedPages(0);
     setStage("analysis");
     setProgress(0);
     setUploadPhase({ active: true, percent: 0 });
+    setHasRestoredSession(true); // Prevent the useEffect from stealing our polling loop
     if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
     let pdfFilename = "";
+    let createdJob = false;
     await new Promise(resolve => setTimeout(resolve, 50));
 
     try {
@@ -492,12 +719,14 @@ export default function ProofreaderFlow() {
       const chunkSize = 9.5 * 1024 * 1024; // 9.5MB chunks to be safe under 10MB Cloudinary raw limit
       const totalSize = file.size;
       const totalParts = Math.ceil(totalSize / chunkSize);
+      uploadPartsRef.current = totalParts;
       const baseId = crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).substring(2);
       
       let start = 0;
       let currentPart = 0;
       
       while (start < totalSize) {
+        if (version !== viewVersionRef.current) return;
         const end = Math.min(start + chunkSize, totalSize);
         const chunk = file.slice(start, end);
         
@@ -540,6 +769,7 @@ export default function ProofreaderFlow() {
           console.error("Cloudinary chunk error:", errText);
           throw new Error(`PDF upload failed for part ${currentPart}: ${uploadRes.status} ${uploadRes.statusText} - ${errText}`);
         }
+        if (version !== viewVersionRef.current) return;
         
         setUploadPhase({ active: true, percent: Math.floor(((currentPart + 1) / totalParts) * 100) });
         start = end;
@@ -571,15 +801,20 @@ export default function ProofreaderFlow() {
       }
       if (!res.ok) throw new Error(created?.error || "Failed to start analysis");
       const { jobId, book } = created;
+      createdJob = true;
+      if (version !== viewVersionRef.current) return;
+      activeJobIdRef.current = jobId;
       setActiveJobId(jobId);
       setActivePdfFilename(null);
       setTotalPages(book.pageCount || 0);
       void refreshSavedBooks();
 
       const poll = async () => {
+        if (version !== viewVersionRef.current) return "stale";
         if (pollInFlightRef.current) return "busy";
         pollInFlightRef.current = true;
         try {
+        const fetchedReviewVersion = reviewVersionRef.current;
         const statusRes = await fetch(`/api/job?id=${encodeURIComponent(jobId)}`, { cache: "no-store" });
         let payload: any = {};
         try {
@@ -588,6 +823,9 @@ export default function ProofreaderFlow() {
           throw new Error(`Server returned an invalid response (HTTP ${statusRes.status})`);
         }
         if (!statusRes.ok) throw new Error(payload?.error || "Could not read analysis status");
+        if (!payload?.book) throw new Error("Server returned no book data");
+        pollFailuresRef.current = 0;
+        if (version !== viewVersionRef.current) return "stale";
         const liveBook = payload.book;
         setAnalysisStatus(liveBook.status);
         const backendPages = payload.pages || [];
@@ -596,6 +834,7 @@ export default function ProofreaderFlow() {
         const expected = Number(liveBook.pageCount || backendPages.length || 0);
         setTotalPages(expected);
         setCompletedPages(done);
+        setIndexedPages(Number(liveBook.progress?.indexed || 0));
         setProgress(expected ? Math.min(100, Math.round(((done + failed) / expected) * 100)) : 0);
         setPages(backendPages.map((page: any) => ({
           page_number: page.pageNumber,
@@ -605,25 +844,26 @@ export default function ProofreaderFlow() {
         if (done > 0 && liveBook.status !== "done") {
           const liveData = buildResponse(liveBook, backendPages);
           setResponseData(liveData);
-          setIssues(liveData.issues);
+          applyLiveIssues(liveData.issues, fetchedReviewVersion);
           if (!marksLoadedRef.current) {
             marksLoadedRef.current = true;
-            setCustomMarks(liveBook.customMarks || []);
+            skipNextSaveRef.current = true;
+            setCustomMarks(Array.isArray(liveBook.customMarks) ? liveBook.customMarks : []);
           }
         }
 
         if (liveBook.status === "done") {
           if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
           const data = buildResponse(liveBook, backendPages);
-          let normalized = data.issues;
+          const normalized = mergeLiveIssues(data.issues, latestIssuesRef.current, fetchedReviewVersion);
           const rawFile = selectedFileRef.current?.rawFile;
           if (rawFile && normalized.length > 0) {
             locateIssuesInPdf(rawFile, normalized).then((refinedIssues) => {
-              setIssues(refinedIssues as ProofreaderIssue[]);
+              if (version === viewVersionRef.current) setIssues((current) => applyIssueGeometry(current, refinedIssues as ProofreaderIssue[]));
             }).catch(() => {});
           }
           setResponseData(data);
-          setIssues(normalized);
+          setIssues((current) => mergeLiveIssues(normalized, current, fetchedReviewVersion));
           setSelectedFile(prev => prev ? { ...prev, pages: expected } : null);
           if (normalized.length) setActiveIssueId(normalized[0].id);
           void refreshSavedBooks();
@@ -633,6 +873,10 @@ export default function ProofreaderFlow() {
         } else if (liveBook.status === "error") {
           if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
           throw new Error(liveBook.error || "Every page failed to analyze");
+        } else if (liveBook.status === "paused") {
+          if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
+          setGlobalError(liveBook.error || "Analysis paused after a provider failure. Resume when ready.");
+          void refreshSavedBooks();
         }
         return liveBook.status as string;
         } finally {
@@ -641,9 +885,10 @@ export default function ProofreaderFlow() {
       };
 
       const initialStatus = await poll();
-      if (initialStatus !== "done") {
+      if (initialStatus !== "done" && initialStatus !== "stale" && version === viewVersionRef.current) {
         pollIntervalRef.current = setInterval(() => {
           poll().catch((error) => {
+            if (version !== viewVersionRef.current) return;
             if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
             setGlobalError(error.message || "Analysis status could not be refreshed");
           });
@@ -651,11 +896,14 @@ export default function ProofreaderFlow() {
       }
 
     } catch (err: any) {
+      if (version !== viewVersionRef.current) return;
       if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
-      setProgress(0);
-      setStage("upload");
-      if (pdfFilename) {
-        fetch("/api/delete-file", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ objectKey: pdfFilename }) }).catch(() => {});
+      if (!createdJob) {
+        setProgress(0);
+        setStage("upload");
+      }
+      if (pdfFilename && !createdJob) {
+        fetch("/api/delete-file", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ objectKey: pdfFilename, totalParts: uploadPartsRef.current }) }).catch(() => {});
       }
       setGlobalError(err?.message || "Analysis could not be started");
     }
@@ -1178,13 +1426,15 @@ export default function ProofreaderFlow() {
 
   const toggleAnalysisPause = async () => {
     if (!activeJobId) return;
+    const version = viewVersionRef.current;
+    const jobId = activeJobId;
     const action = analysisStatus === "paused" || analysisStatus === "error" ? "resume" : "pause";
     const previousStatus = analysisStatus;
     // Optimistic update for instant smooth UI feedback
     setAnalysisStatus(action === "pause" ? "paused" : "queued");
     
     try {
-      const response = await fetch(`/api/books/${encodeURIComponent(activeJobId)}/${action}`, { method: "POST" });
+      const response = await fetch(`/api/books/${encodeURIComponent(jobId)}/${action}`, { method: "POST" });
       let payload: any = {};
       try {
         payload = await response.json();
@@ -1192,9 +1442,26 @@ export default function ProofreaderFlow() {
         throw new Error(`Server returned an invalid response (HTTP ${response.status})`);
       }
       if (!response.ok) throw new Error(payload?.error || `Could not ${action} analysis`);
+      if (version !== viewVersionRef.current || activeJobIdRef.current !== jobId) return;
       // Update with server truth
       setAnalysisStatus(payload.book.status);
+      if (action === "resume") {
+        // The poller was stopped when the job paused/errored; restart it so
+        // newly found issues stream onto the canvas immediately.
+        setGlobalError(null);
+        const known = savedBooks.find((b) => b.id === activeJobId);
+        startLivePolling(known ?? ({
+          id: activeJobId,
+          title: selectedFile?.subject || selectedFile?.name?.replace(/\.pdf$/i, "") || "Untitled",
+          originalName: selectedFile?.name,
+          pageCount: totalPages,
+          status: payload.book.status,
+        } as SavedBook));
+      } else if (pollIntervalRef.current) {
+        clearInterval(pollIntervalRef.current);
+      }
     } catch (error: any) {
+      if (version !== viewVersionRef.current || activeJobIdRef.current !== jobId) return;
       // Rollback on failure
       setAnalysisStatus(previousStatus);
       setGlobalError(error.message || "Analysis control failed");
@@ -1203,13 +1470,20 @@ export default function ProofreaderFlow() {
 
   const updateIssueStatus = async (issue: ProofreaderIssue, status: "open" | "accepted" | "dismissed") => {
     if (!activeJobId || !issue.backendUid || !issue.page) return;
-    const response = await fetch(
+    pendingStatusRef.current.set(issue.backendUid, status);
+    reviewVersionRef.current++;
+    try {
+      const response = await fetch(
       `/api/books/${encodeURIComponent(activeJobId)}/pages/${issue.page}/issues/${encodeURIComponent(issue.backendUid)}`,
       { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ status }) }
     );
-    if (!response.ok) {
+      if (!response.ok) {
       const payload = await response.json().catch(() => ({}));
-      throw new Error(payload.error || "Could not save review decision");
+        throw new Error(payload.error || "Could not save review decision");
+      }
+    } finally {
+      pendingStatusRef.current.delete(issue.backendUid);
+      reviewVersionRef.current++;
     }
   };
 
@@ -1219,26 +1493,26 @@ export default function ProofreaderFlow() {
 
   const resetSession = async () => {
     if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
-    // Cancel any pending debounced save – we're tearing down the session
-    flushMarksSave();
-    if (activeJobId && ["queued", "processing", "paused", "error"].includes(analysisStatus)) {
+    try { await flushMarksSave(); } catch (error: any) {
+      setGlobalError(error.message || "Could not save manual marks"); return;
+    }
+    viewVersionRef.current++;
+    setIsRefiningIssues(false);
+    if (activeJobId && ["queued", "processing"].includes(analysisStatus)) {
       try {
-        await fetch(`/api/books/${encodeURIComponent(activeJobId)}`, { method: "DELETE" });
+        await fetch(`/api/books/${encodeURIComponent(activeJobId)}/pause`, { method: "POST", keepalive: true });
       } catch (err) {
-        console.warn("Failed to remove proofread:", err);
+        console.warn("Failed to pause proofread:", err);
       }
     }
+    activeJobIdRef.current = null;
     setActiveJobId(null);
 
-    // Delete temporary file from S3 storage
-    if (activePdfFilename) {
-      try {
-        await fetch('/api/delete-file', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ objectKey: activePdfFilename }) });
-      } catch (err) {
-        console.warn("Failed to delete temporary file:", err);
-      }
-      setActivePdfFilename(null);
-    }
+    // DO NOT delete the temporary file from Cloudinary storage here.
+    // The Vercel function requires this file to exist so it can download it to
+    // /tmp when resuming the paused book. It is deleted only when the proofread
+    // is permanently deleted via `deleteSavedBook`.
+    setActivePdfFilename(null);
 
     setSelectedFile(null);
     setProgress(0);
@@ -1277,12 +1551,22 @@ export default function ProofreaderFlow() {
       />
 
       <AgenticBot
+        key={activeJobId || "no-project"}
         bookId={activeJobId}
         pageNumber={currentPage}
         stage={stage}
         projectTitle={selectedFile?.name}
+        sidebarIssueMap={issues.map((issue,index)=>({number:index+1,uid:issue.backendUid!,page:issue.page!})).filter(issue=>issue.uid && issue.page)}
         activeIssueUid={issues.find((issue) => issue.id === activeIssueId)?.backendUid}
         onNavigatePage={(page) => { setCurrentPage(page); setStage("review"); }}
+        onAnalysisAction={async () => {
+          if (!activeJobId || !selectedFile) return;
+          const saved = savedBooks.find((book) => book.id === activeJobId) || {
+            id: activeJobId, title: selectedFile.subject, originalName: selectedFile.name,
+            pageCount: totalPages, status: analysisStatus,
+          };
+          await openSavedBook(saved, true);
+        }}
       />
 
       {/* Main Content Area */}
@@ -1417,7 +1701,7 @@ export default function ProofreaderFlow() {
                         progress={progress} totalPages={totalPages} completedPages={completedPages}
                         fileName={selectedFile?.name} fileSize={selectedFile?.size} selectedScanTypes={activeScanTypes}
                         status={analysisStatus} onPauseToggle={toggleAnalysisPause}
-                        uploadPhase={uploadPhase}
+                        uploadPhase={uploadPhase} indexedPages={indexedPages}
                         onCancel={resetSession} onViewReport={() => setStage(analysisStatus === "done" ? "dashboard" : "review")}
                       />
                     </motion.div>
@@ -1446,12 +1730,14 @@ export default function ProofreaderFlow() {
                       className="flex-1 min-h-0 flex flex-col overflow-hidden"
                     >
                       <ReviewStage
+                        key={activeJobId || "no-project"}
                         selectedFile={selectedFile}
                         issues={issues} setIssues={setIssues} customMarks={customMarks} setCustomMarks={setCustomMarks}
                         currentPage={currentPage} setCurrentPage={setCurrentPage} activeIssueId={activeIssueId}
                         setActiveIssueId={setActiveIssueId} pages={pages} onNext={() => setStage("export")}
                         onIssueStatus={updateIssueStatus}
                         isRefiningIssues={isRefiningIssues}
+                        analysisWarnings={responseData?.perPage?.find((page: any) => page.pageNumber === currentPage)?.analysisWarnings || []}
                       />
                     </motion.div>
                   )}
@@ -1541,7 +1827,7 @@ export default function ProofreaderFlow() {
             <p className="text-slate-500 text-sm mb-8 leading-relaxed font-medium">
               {analysisStatus === "done"
                 ? "This closes the current view. The completed proofread and review decisions stay saved in Recent proofreads."
-                : "This aborts the active analysis and removes its temporary job data. This cannot be undone."}
+                : "This closes the current view. The unfinished analysis is paused and kept in Recent proofreads — you can resume it anytime."}
             </p>
             <div className="flex gap-3">
               <button

@@ -31,6 +31,7 @@ const bookSchema = new mongoose.Schema(
       current: { type: Number, default: 0 },
       done: { type: Number, default: 0 },
       failed: { type: Number, default: 0 },
+      indexed: { type: Number, default: 0 },
     },
     stats: {
       issues: { type: Number, default: 0 },
@@ -44,10 +45,15 @@ const bookSchema = new mongoose.Schema(
       type: mongoose.Schema.Types.Mixed,
       default: () => ({ toc: [], units: [], chapters: [] }),
     },
+    chapterAnalysis: {
+      type: mongoose.Schema.Types.Mixed,
+      default: () => ({ status: "pending", version: "", chapters: 0, tokensUsed: 0 }),
+    },
     customMarks: {
       type: mongoose.Schema.Types.Mixed,
       default: () => [],
     },
+    analysisFailureCount: { type:Number,default:0 },
     error: String,
     // Cloudinary key of the source PDF — used to re-download the file for each
     // page processing invocation (required for stateless/serverless deployment).
@@ -57,4 +63,8 @@ const bookSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
-export default mongoose.models.Book || mongoose.model("Book", bookSchema);
+const cachedBook = mongoose.models.Book;
+if (cachedBook && !cachedBook.schema.path("progress.indexed")) {
+  cachedBook.schema.add({ "progress.indexed": { type: Number, default: 0 } });
+}
+export default cachedBook || mongoose.model("Book", bookSchema);

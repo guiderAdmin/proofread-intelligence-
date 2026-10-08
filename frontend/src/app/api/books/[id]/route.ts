@@ -1,22 +1,17 @@
 import { NextRequest, NextResponse } from "next/server";
-import mongoose from "mongoose";
 import Book from "@/server/models/Book.js";
 import Page from "@/server/models/Page.js";
 import { connectDb } from "@/server/db.js";
-import { assertSameOrigin, apiError, HttpError } from "@/server/http.js";
+import { assertSameOrigin, apiError, HttpError, readJsonBody, validateBookId, validateCustomMarks } from "@/server/http.js";
 import { removeBookFiles, serializeBook, serializePage, tick } from "@/server/services/queue.js";
 import { deleteAgentSession } from "../../../../../feature/agentic-bot/server/knowledge.js";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-function validateId(id: string) {
-  if (!mongoose.isValidObjectId(id)) throw new HttpError(400, "Invalid proofread id");
-}
-
 export async function GET(_request: NextRequest, { params }: { params: { id: string } }) {
   try {
-    validateId(params.id);
+    validateBookId(params.id);
     await connectDb();
     const book = await Book.findById(params.id);
     if (!book) throw new HttpError(404, "Proofread not found");
@@ -31,10 +26,12 @@ export async function GET(_request: NextRequest, { params }: { params: { id: str
 export async function DELETE(request: NextRequest, { params }: { params: { id: string } }) {
   try {
     assertSameOrigin(request);
-    validateId(params.id);
+    validateBookId(params.id);
     await connectDb();
     const book = await Book.findById(params.id);
     if (!book) throw new HttpError(404, "Proofread not found");
+    // Stop new page claims before deleting durable jobs and remote assets.
+    await Book.updateOne({ _id: book._id }, { $set: { status: "paused" } });
     await Page.deleteMany({ bookId: book._id });
     await deleteAgentSession(book._id);
     await removeBookFiles(book._id);
@@ -48,16 +45,17 @@ export async function DELETE(request: NextRequest, { params }: { params: { id: s
 export async function PATCH(request: NextRequest, { params }: { params: { id: string } }) {
   try {
     assertSameOrigin(request);
-    validateId(params.id);
+    validateBookId(params.id);
     await connectDb();
     const book = await Book.findById(params.id);
     if (!book) throw new HttpError(404, "Proofread not found");
     
-    const body = await request.json();
+    const body = await readJsonBody(request);
     if (body.customMarks !== undefined) {
-      book.customMarks = body.customMarks;
-      book.markModified('customMarks');
-      await book.save();
+      const customMarks = validateCustomMarks(body.customMarks, book.pageCount);
+      const updated = await Book.findByIdAndUpdate(params.id, { $set: { customMarks } }, { new: true });
+      if (!updated) throw new HttpError(404, "Proofread not found");
+      return NextResponse.json({ success: true, customMarks: updated.customMarks });
     }
     
     return NextResponse.json({ success: true, customMarks: book.customMarks });

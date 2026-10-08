@@ -2,14 +2,14 @@ import React, { useLayoutEffect, useRef, useState } from "react";
 
 interface LeaderLineProps {
   rootRef: React.RefObject<HTMLDivElement>;
-  fromElement: HTMLElement | null;
-  toElement: HTMLElement | null;
+  fromId: string | null;
+  toId: string | null;
   color?: string;
 }
 
-export default function LeaderLine({ rootRef, fromElement, toElement, color = "#c93428" }: LeaderLineProps) {
+export default function LeaderLine({ rootRef, fromId, toId, color = "#c93428" }: LeaderLineProps) {
   const [isVisible, setIsVisible] = useState(false);
-  
+
   // Refs for direct DOM manipulation to achieve 60fps scrolling
   const svgRef = useRef<SVGSVGElement>(null);
   const pathBgRef = useRef<SVGPathElement>(null);
@@ -19,7 +19,7 @@ export default function LeaderLine({ rootRef, fromElement, toElement, color = "#
 
   useLayoutEffect(() => {
     const root = rootRef?.current;
-    if (!root || !fromElement || !toElement) {
+    if (!root || !fromId || !toId) {
       setIsVisible(false);
       return undefined;
     }
@@ -27,6 +27,14 @@ export default function LeaderLine({ rootRef, fromElement, toElement, color = "#
     let rafId: number;
 
     const draw = () => {
+      const fromElement = document.getElementById(fromId);
+      const toElement = document.getElementById(toId);
+
+      if (!root || !fromElement || !toElement) {
+        setIsVisible(false);
+        return;
+      }
+
       const r = root.getBoundingClientRect();
       const a = fromElement.getBoundingClientRect();
       const b = toElement.getBoundingClientRect();
@@ -42,10 +50,10 @@ export default function LeaderLine({ rootRef, fromElement, toElement, color = "#
       // 'from' is the PDF highlight, 'to' is the sidebar card
       const x1 = a.right - r.left; // Right side of PDF highlight
       const y1 = a.top + a.height / 2 - r.top;
-      
+
       const x2 = b.left - r.left; // Left side of sidebar card
       const y2 = b.top + 24 - r.top; // Pointing near the top of the card
-      
+
       const mid = (x1 + x2) / 2;
       const d = `M ${x1} ${y1} C ${mid} ${y1}, ${mid} ${y2}, ${x2} ${y2}`;
 
@@ -72,12 +80,12 @@ export default function LeaderLine({ rootRef, fromElement, toElement, color = "#
     };
 
     scheduleDraw();
-    
+
     const ro = new ResizeObserver(scheduleDraw);
     ro.observe(root);
     window.addEventListener("scroll", scheduleDraw, true);
     window.addEventListener("resize", scheduleDraw);
-    
+
     // Polling fallback just in case PDF layer shifts without firing scroll/resize
     const t = setInterval(scheduleDraw, 100);
 
@@ -88,10 +96,10 @@ export default function LeaderLine({ rootRef, fromElement, toElement, color = "#
       window.removeEventListener("scroll", scheduleDraw, true);
       window.removeEventListener("resize", scheduleDraw);
     };
-  }, [rootRef, fromElement, toElement]);
+  }, [rootRef, fromId, toId]);
 
-  if (!fromElement || !toElement) return null;
-  
+  if (!fromId || !toId) return null;
+
   return (
     <svg
       ref={svgRef}

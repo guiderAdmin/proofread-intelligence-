@@ -1,15 +1,17 @@
 import { NextResponse } from "next/server";
 import Page from "@/server/models/Page.js";
 import { connectDb } from "@/server/db.js";
-import { apiError, HttpError } from "@/server/http.js";
+import { apiError, HttpError, validateBookId, validatePageNumber } from "@/server/http.js";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 export async function GET(_request: Request, { params }: { params: { id: string; pageNumber: string } }) {
   try {
+    validateBookId(params.id);
+    const pageNumber = validatePageNumber(params.pageNumber);
     await connectDb();
-    const page: any = await Page.findOne({ bookId: params.id, pageNumber: Number(params.pageNumber) }).lean();
+    const page: any = await Page.findOne({ bookId: params.id, pageNumber }).lean();
     if (!page?.imagePath) throw new HttpError(404, "Page image is not ready");
 
     // Cloudinary URL (Vercel-deployed) — redirect directly

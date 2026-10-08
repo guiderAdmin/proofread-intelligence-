@@ -3,6 +3,7 @@
 import React, { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { Camera, ChevronDown, GripHorizontal, Loader2, MousePointer2, Send, Sparkles, Trash2, X } from "lucide-react";
+import Image from "next/image";
 
 type AgentMessage = {
   role: "user" | "assistant";
@@ -17,7 +18,9 @@ interface AgenticBotProps {
   stage: string;
   projectTitle?: string;
   activeIssueUid?: string;
+  sidebarIssueMap?: Array<{ number: number; uid: string; page: number }>;
   onNavigatePage?: (pageNumber: number) => void;
+  onAnalysisAction?: () => void | Promise<void>;
 }
 
 type Point = { x: number; y: number };
@@ -96,7 +99,7 @@ function cropPdfCanvas(rect: CaptureRect): string | null {
   const sy = Math.max(0, (top - best.bounds.top) * scaleY);
   const sw = Math.max(1, (right - left) * scaleX);
   const sh = Math.max(1, (bottom - top) * scaleY);
-  const maxSide = 1400;
+  const maxSide = 2000;
   const outputScale = Math.min(1, maxSide / Math.max(sw, sh));
   const output = document.createElement("canvas");
   output.width = Math.max(1, Math.round(sw * outputScale));
@@ -107,7 +110,50 @@ function cropPdfCanvas(rect: CaptureRect): string | null {
   return output.toDataURL("image/jpeg", 0.82);
 }
 
-export function AgenticBot({ bookId, pageNumber, stage, projectTitle, activeIssueUid, onNavigatePage }: AgenticBotProps) {
+/**
+ * Capture the largest rendered instance of the active PDF page. Review view can
+ * contain both a thumbnail and the main page, so choosing by rendered area
+ * prevents the assistant from receiving a tiny sidebar image. The snapshot is
+ * created at send time, making the visual evidence match what the user is
+ * currently viewing rather than a stale server-side extraction.
+ */
+function captureActivePdfPage(pageNumber: number): string | null {
+  const exactSelector = `.react-pdf__Page[data-page-number="${pageNumber}"] canvas`;
+  const candidates = Array.from(document.querySelectorAll(exactSelector)) as HTMLCanvasElement[];
+  const source = candidates
+    .filter((canvas) => {
+      const bounds = canvas.getBoundingClientRect();
+      return canvas.width > 0 && canvas.height > 0 && bounds.width > 0 && bounds.height > 0;
+    })
+    .sort((a, b) => {
+      const aBounds = a.getBoundingClientRect();
+      const bBounds = b.getBoundingClientRect();
+      return (bBounds.width * bBounds.height) - (aBounds.width * aBounds.height);
+    })[0];
+  if (!source) return null;
+
+  const maxSide = 2000;
+  const scale = Math.min(1, maxSide / Math.max(source.width, source.height));
+  const output = document.createElement("canvas");
+  output.width = Math.max(1, Math.round(source.width * scale));
+  output.height = Math.max(1, Math.round(source.height * scale));
+  const context = output.getContext("2d");
+  if (!context) return null;
+  context.drawImage(source, 0, 0, source.width, source.height, 0, 0, output.width, output.height);
+  return output.toDataURL("image/jpeg", 0.9);
+}
+
+function requestsFullPageVisual(message: string) {
+  const text = message.toLowerCase().replace(/\s+/g, " ").trim();
+  return (
+    /\b(?:full|whole|entire)\s+(?:current\s+|this\s+)?page\b/.test(text) ||
+    /\b(?:analy[sz]e|review|inspect|describe)\s+(?:the\s+)?(?:current\s+|this\s+)?page\s*[?.!]*$/.test(text) ||
+    /\btell\s+me\s+(?:everything\s+)?about\s+(?:the\s+)?(?:current\s+|this\s+)?page\b/.test(text) ||
+    /\bwhat(?:'s|\s+is)\s+(?:shown\s+|there\s+)?on\s+(?:this|the\s+current)\s+page\b/.test(text)
+  );
+}
+
+export function AgenticBot({ bookId, pageNumber, stage, projectTitle, activeIssueUid, onNavigatePage, onAnalysisAction, sidebarIssueMap }: AgenticBotProps) {
   const [mounted, setMounted] = useState(false);
   const [expanded, setExpanded] = useState(false);
   const [messages, setMessages] = useState<AgentMessage[]>([]);
@@ -132,6 +178,7 @@ export function AgenticBot({ bookId, pageNumber, stage, projectTitle, activeIssu
   const shellRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const previousPageRef = useRef(pageNumber);
+  const bookVersionRef = useRef(0);
 
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -173,14 +220,21 @@ export function AgenticBot({ bookId, pageNumber, stage, projectTitle, activeIssu
   }, [docked, expanded]);
 
   useEffect(() => {
+    bookVersionRef.current++;
     setMessages([]);
     setSelectedText("");
+    setCaptureDataUrl("");
+    setBusy(false);
+    setHistoryLoading(false);
+    setError("");
     lastPdfSelectionRef.current = "";
     loadedBookRef.current = null;
+    return () => { bookVersionRef.current++; };
   }, [bookId]);
 
   useEffect(() => {
     setSelectedText("");
+    setCaptureDataUrl("");
     lastPdfSelectionRef.current = "";
     if (previousPageRef.current !== pageNumber) {
       previousPageRef.current = pageNumber;
@@ -286,22 +340,20 @@ export function AgenticBot({ bookId, pageNumber, stage, projectTitle, activeIssu
   const loadConversation = async () => {
     if (!bookId || loadedBookRef.current === bookId) return;
     loadedBookRef.current = bookId;
+    const version = bookVersionRef.current;
     setHistoryLoading(true);
     try {
       const response = await fetch(`/api/agentic-bot?bookId=${encodeURIComponent(bookId)}`, { cache: "no-store" });
-      let payload: any = {};
-      try {
-        payload = await response.json();
-      } catch (e) {
-        if (!response.ok) throw new Error(`Server returned an invalid response (HTTP ${response.status}) - maybe a timeout?`);
-      }
+      const payload = await response.json();
+      if (version !== bookVersionRef.current) return;
       if (!response.ok) throw new Error(payload?.error || "Could not load companion");
       setMessages(payload.messages || []);
     } catch (reason: any) {
+      if (version !== bookVersionRef.current) return;
       loadedBookRef.current = null;
       setError(reason.message || "Could not load companion");
     } finally {
-      setHistoryLoading(false);
+      if (version === bookVersionRef.current) setHistoryLoading(false);
     }
   };
 
@@ -364,12 +416,30 @@ export function AgenticBot({ bookId, pageNumber, stage, projectTitle, activeIssu
 
   const send = async () => {
     const message = input.trim();
-    if (!message || busy) return;
+    if (!message || busy || historyLoading) return;
     if (!bookId) {
       setError("Open or start a proofreading project so Proof Intelligence has live context.");
       return;
     }
-    const optimistic: AgentMessage = { role: "user", content: message, pageNumber, hasCapture: Boolean(captureDataUrl) };
+    const version = bookVersionRef.current;
+    const fullPageRequested = requestsFullPageVisual(message) || /\b(?:where|locat\w*|headings?|capitali[sz]\w*|missing|missed|ignored|issues?|errors?)\b/i.test(message);
+    let fullPageDataUrl = "";
+    if (!captureDataUrl && fullPageRequested) {
+      try {
+        fullPageDataUrl = captureActivePdfPage(pageNumber) || "";
+      } catch {
+        fullPageDataUrl = "";
+      }
+    }
+    const visualDataUrl = captureDataUrl || fullPageDataUrl;
+    const captureKind = captureDataUrl
+      ? "region"
+      : fullPageDataUrl
+        ? "full_page"
+        : fullPageRequested
+          ? "full_page_unavailable"
+          : "none";
+    const optimistic: AgentMessage = { role: "user", content: message, pageNumber, hasCapture: Boolean(visualDataUrl) };
     setMessages((current) => [...current, optimistic]);
     setInput("");
     setBusy(true);
@@ -378,27 +448,30 @@ export function AgenticBot({ bookId, pageNumber, stage, projectTitle, activeIssu
       const response = await fetch("/api/agentic-bot", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ bookId, pageNumber, message, selectedText, captureDataUrl, activeIssueUid, stage, isDetailed }),
+        body: JSON.stringify({ bookId, pageNumber, message, selectedText, captureDataUrl: visualDataUrl, captureKind, activeIssueUid, sidebarIssueMap, stage, isDetailed }),
       });
-      let payload: any = {};
-      try {
-        payload = await response.json();
-      } catch (e) {
-        if (!response.ok) throw new Error(`Server returned an invalid response (HTTP ${response.status}) - maybe a timeout?`);
-      }
+      const payload = await response.json();
+      if (version !== bookVersionRef.current) return;
       if (!response.ok) throw new Error(payload?.error || "Assistant request failed");
       setMessages((current) => [...current, { role: "assistant", content: payload.answer, pageNumber }]);
       if (payload.action?.kind === "navigate" && Number.isInteger(payload.action.pageNumber)) {
         onNavigatePage?.(payload.action.pageNumber);
       }
+      if (["pause", "resume", "reanalyze", "findings_updated"].includes(payload.action?.kind)) await onAnalysisAction?.();
       setCaptureDataUrl("");
       setSelectedText("");
     } catch (reason: any) {
+      if (version !== bookVersionRef.current) return;
       setError(reason.message || "Assistant request failed");
     } finally {
-      setBusy(false);
+      if (version === bookVersionRef.current) setBusy(false);
     }
   };
+
+  const isLeftHalf = position
+    ? position.x < (typeof window !== "undefined" ? window.innerWidth / 2 : 500)
+    : docked;
+
 
   return createPortal(
     <>
@@ -427,7 +500,7 @@ export function AgenticBot({ bookId, pageNumber, stage, projectTitle, activeIssu
 
       <div
         ref={shellRef}
-        className={`fixed ${expanded ? "w-auto" : "h-[48px] w-[48px]"}`}
+        className={`${docked ? "absolute" : "fixed"} ${expanded ? "w-auto" : "h-[48px] w-[48px]"}`}
         style={position
           ? { left: position.x, top: position.y, zIndex: expanded ? 2147483646 : 60, touchAction: "none" }
           : expanded
@@ -449,7 +522,7 @@ export function AgenticBot({ bookId, pageNumber, stage, projectTitle, activeIssu
             <span className="absolute inset-[4px] rounded-full border border-white/25 bg-white/10" />
             <Sparkles className="relative h-5 w-5 drop-shadow-sm" strokeWidth={2.25} />
             <span className="absolute right-0 top-0 h-2.5 w-2.5 rounded-full border-2 border-white bg-emerald-500 shadow-sm" />
-            <span className="pointer-events-none absolute right-[56px] top-1/2 hidden -translate-y-1/2 whitespace-nowrap rounded-full border border-orange-100 bg-white/95 px-3 py-1.5 text-[10px] font-bold text-slate-700 shadow-lg backdrop-blur-md group-hover:block">
+            <span className={`pointer-events-none absolute top-1/2 hidden -translate-y-1/2 whitespace-nowrap rounded-full border border-orange-100 bg-white/95 px-3 py-1.5 text-[10px] font-bold text-slate-700 shadow-lg backdrop-blur-md group-hover:block ${isLeftHalf ? "left-[56px]" : "right-[56px]"}`}>
               {bookId ? "Proof Intelligence is live" : "Proof Intelligence"}
             </span>
           </button>
@@ -521,7 +594,7 @@ export function AgenticBot({ bookId, pageNumber, stage, projectTitle, activeIssu
                     <div className={`mt-1.5 flex items-center gap-1.5 text-[9px] font-medium text-slate-400 ${message.role === "user" ? "pr-1" : "pl-8"}`}>
                       {message.pageNumber && message.role === "user" && <span>Page {message.pageNumber}</span>}
                       {message.hasCapture && message.pageNumber && message.role === "user" && <span>•</span>}
-                      {message.hasCapture && <span>Region attached</span>}
+                      {message.hasCapture && <span>Live visual attached</span>}
                     </div>
                   )}
                 </div>
@@ -532,7 +605,7 @@ export function AgenticBot({ bookId, pageNumber, stage, projectTitle, activeIssu
             {(selectedText || captureDataUrl) && (
               <div className="px-3 pt-2 flex gap-2 bg-white">
                 {selectedText && <span className="min-w-0 flex-1 truncate rounded-lg border border-orange-200 bg-orange-50 px-2 py-1 text-[10px] font-semibold text-orange-800" title={selectedText}>Selected: “{selectedText}”</span>}
-                {captureDataUrl && <div className="relative h-12 w-16 overflow-hidden rounded-lg border border-brand-200"><img src={captureDataUrl} alt="Captured PDF region" className="h-full w-full object-cover" /><button onClick={() => setCaptureDataUrl("")} className="absolute right-0 top-0 rounded-bl-md bg-brand-600/90 p-0.5 text-white transition hover:bg-brand-700"><X className="h-3 w-3" /></button></div>}
+                {captureDataUrl && <div className="relative h-12 w-16 overflow-hidden rounded-lg border border-brand-200"><Image src={captureDataUrl} alt="Captured PDF region" fill className="object-cover" /><button onClick={() => setCaptureDataUrl("")} className="absolute right-0 top-0 rounded-bl-md bg-brand-600/90 p-0.5 text-white transition hover:bg-brand-700"><X className="h-3 w-3" /></button></div>}
               </div>
             )}
             {error && <div className="mx-4 mt-2 rounded-xl border border-red-100 bg-red-50 px-3 py-2 text-[10px] font-medium text-red-600">{error}</div>}
@@ -548,28 +621,31 @@ export function AgenticBot({ bookId, pageNumber, stage, projectTitle, activeIssu
                   maxLength={2400}
                   className="custom-scrollbar max-h-32 min-h-[44px] w-full resize-none bg-transparent px-3 py-2.5 text-xs text-slate-800 outline-none placeholder:text-slate-400"
                 />
-                <div className="flex items-center justify-between px-1 pb-1">
-                  <div className="flex items-center gap-1">
-                    <button disabled={!bookId} onPointerDown={(event) => event.preventDefault()} onClick={useCurrentSelection} className="flex h-8 items-center gap-1.5 rounded-xl px-2.5 text-[10px] font-bold text-slate-500 transition-colors hover:bg-slate-100 hover:text-slate-800 disabled:opacity-40" title="Use highlighted text">
+                <div className="flex w-full items-center justify-between px-1 pb-1">
+                  <div className="flex h-8 flex-1 min-w-0 flex-wrap items-center gap-1 overflow-hidden">
+                    <button disabled={!bookId} onPointerDown={(event) => event.preventDefault()} onClick={useCurrentSelection} className="flex shrink-0 h-8 items-center gap-1.5 rounded-xl px-2.5 text-[10px] font-bold text-slate-500 transition-colors hover:bg-slate-100 hover:text-slate-800 disabled:opacity-40" title="Use highlighted text">
                       <MousePointer2 className="h-3.5 w-3.5" /> <span className="hidden sm:inline">Text</span>
                     </button>
-                    <button disabled={!bookId} onClick={() => { setExpanded(false); setCaptureMode(true); setError(""); }} className="flex h-8 items-center gap-1.5 rounded-xl px-2.5 text-[10px] font-bold text-slate-500 transition-colors hover:bg-slate-100 hover:text-slate-800 disabled:opacity-40" title="Capture region">
+                    <button disabled={!bookId} onClick={() => { setExpanded(false); setCaptureMode(true); setError(""); }} className="flex shrink-0 h-8 items-center gap-1.5 rounded-xl px-2.5 text-[10px] font-bold text-slate-500 transition-colors hover:bg-slate-100 hover:text-slate-800 disabled:opacity-40" title="Capture region">
                       <Camera className="h-3.5 w-3.5" /> <span className="hidden sm:inline">Region</span>
                     </button>
-                    <div className="mx-1 h-4 w-px bg-slate-200"></div>
-                    <button onClick={() => setIsDetailed(!isDetailed)} className={`flex h-8 items-center gap-1.5 rounded-xl px-2.5 text-[10px] font-bold transition-colors ${isDetailed ? 'bg-brand-50 text-brand-700' : 'text-slate-500 hover:bg-slate-100 hover:text-slate-800'}`} title="Toggle detailed response">
-                      Detailed
-                      <span className={`flex h-3.5 w-6 items-center rounded-full p-0.5 transition-colors ${isDetailed ? 'justify-end bg-brand-500' : 'justify-start bg-slate-300'}`}>
-                        <span className="h-2.5 w-2.5 rounded-full bg-white shadow-sm" />
-                      </span>
-                    </button>
+
+                    <div className="flex shrink-0 items-center gap-1">
+                      <div className="mx-1 h-4 w-px bg-slate-200"></div>
+                      <button onClick={() => setIsDetailed(!isDetailed)} className={`flex h-8 items-center gap-1.5 rounded-xl px-2.5 text-[10px] font-bold transition-colors ${isDetailed ? 'bg-brand-50 text-brand-700' : 'text-slate-500 hover:bg-slate-100 hover:text-slate-800'}`} title="Toggle detailed response">
+                        Detailed
+                        <span className={`flex h-3.5 w-6 items-center rounded-full p-0.5 transition-colors ${isDetailed ? 'justify-end bg-brand-500' : 'justify-start bg-slate-300'}`}>
+                          <span className="h-2.5 w-2.5 rounded-full bg-white shadow-sm" />
+                        </span>
+                      </button>
+                    </div>
                     {(selectedText || captureDataUrl) && (
                       <button onClick={() => { setSelectedText(""); setCaptureDataUrl(""); }} className="ml-1 flex h-8 w-8 items-center justify-center rounded-xl text-red-400 transition-colors hover:bg-red-50 hover:text-red-600" title="Clear attachments">
                         <Trash2 className="h-3.5 w-3.5" />
                       </button>
                     )}
                   </div>
-                  <button disabled={busy || !input.trim() || !bookId} onClick={() => void send()} className="flex h-8 w-8 shrink-0 items-center justify-center rounded-xl bg-slate-900 text-white shadow-sm transition-all hover:scale-105 hover:bg-slate-800 disabled:scale-100 disabled:bg-slate-100 disabled:text-slate-400 disabled:shadow-none">
+                  <button disabled={busy || historyLoading || !input.trim() || !bookId} onClick={() => void send()} className="flex h-8 w-8 shrink-0 items-center justify-center rounded-xl bg-slate-900 text-white shadow-sm transition-all hover:scale-105 hover:bg-slate-800 disabled:scale-100 disabled:bg-slate-100 disabled:text-slate-400 disabled:shadow-none">
                     <Send className="ml-0.5 h-3.5 w-3.5" />
                   </button>
                 </div>

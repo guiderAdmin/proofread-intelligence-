@@ -66,7 +66,7 @@ export default function IssueList({
   if (!issues.length) {
     return (
       <div className="rounded-2xl border border-slate-200 bg-white/60 p-6 text-sm text-slate-500 text-center m-4 shadow-sm">
-        No issues flagged on this page. If analysis is complete, all 12 deep-dive checks passed cleanly!
+        No findings are currently recorded. Check the analysis status before treating the document as reviewed.
       </div>
     );
   }
@@ -77,6 +77,8 @@ export default function IssueList({
         const active = issue.id === selectedId;
         const color = TYPE_COLOR[issue.type.toLowerCase()] || TYPE_COLOR[issue.category.toLowerCase()] || "#c93428";
         const ruleTag = getRuleTag(issue);
+        const pendingVerification = !["pdf_text", "ocr_text"].includes(issue.bboxSource || "") &&
+          ["spelling", "grammar", "punctuation", "typography", "heading", "wording"].includes(issue.type);
         
         // Determine status from the new schema
         const status = issue.resolved ? "accepted" : (issue.ignored ? "dismissed" : "open");
@@ -134,6 +136,12 @@ export default function IssueList({
                 <p className="mt-2 font-medium leading-5 text-slate-800 text-xs break-words">
                   {issue.originalText || "Visual/Layout Issue"}
                 </p>
+                {issue.seenInLatestAnalysis === false && (
+                  <p className="mt-1 text-[10px] text-amber-700">Retained from an earlier analysis. Review this finding before dismissing it.</p>
+                )}
+                {!issue.bbox && (
+                  <p className="mt-1 text-[10px] text-slate-500">{pendingVerification ? "Unverified candidate. Confirm the printed text before treating this as an error." : "Location could not be verified on the page."}</p>
+                )}
 
                 {issue.suggestedText && (
                   <div className="mt-2 flex items-start gap-1 text-xs text-emerald-600">
@@ -153,12 +161,12 @@ export default function IssueList({
             {active && (
               <div className="mt-3 flex items-center justify-between border-t border-slate-100 pt-2.5 pl-8 animate-in fade-in duration-200">
                 <div className="flex gap-2">
-                  <Mini
+                  {!pendingVerification && <Mini
                     onClick={() => onStatus(issue.id, "accepted")}
                     className="text-emerald-600 hover:bg-emerald-50 border border-transparent hover:border-emerald-100"
                     icon={<Check size={13} />}
                     label="Accept Fix"
-                  />
+                  />}
                   <Mini
                     onClick={() => onStatus(issue.id, "dismissed")}
                     className="text-slate-500 hover:bg-slate-100 border border-transparent hover:border-slate-200"

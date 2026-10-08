@@ -44,3 +44,10 @@ next-env.d.ts
 /tmp
 *.pdf
 *.log
+*.traineddata
+.data/
+
+# Isolated production validation build
+/.next-reliability-check/
+
+/.next-dev/

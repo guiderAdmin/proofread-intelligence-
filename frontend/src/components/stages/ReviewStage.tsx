@@ -54,9 +54,10 @@ interface ReviewStageProps {
   activeIssueId: number | null;
   setActiveIssueId: (id: number | null) => void;
   pages?: ProofreaderPageData[];
-  onIssueStatus?: (issue: ProofreaderIssue, status: "accepted" | "dismissed") => Promise<void>;
+  onIssueStatus?: (issue: ProofreaderIssue, status: "open" | "accepted" | "dismissed") => Promise<void>;
   onNext: () => void;
   isRefiningIssues?: boolean;
+  analysisWarnings?: string[];
 }
 
 export function ReviewStage({
@@ -73,6 +74,7 @@ export function ReviewStage({
   onIssueStatus,
   onNext,
   isRefiningIssues = false,
+  analysisWarnings = [],
 }: ReviewStageProps) {
   const [activeTool, setActiveTool] = useState<"circle" | "square" | "select">("select");
   const [zoomLevel, setZoomLevel] = useState<number>(100);
@@ -111,8 +113,13 @@ export function ReviewStage({
   const rootRef = useRef<HTMLDivElement>(null);
   const cardRefs = useRef<Record<number, HTMLElement | null>>({});
   const markCardRefs = useRef<Record<string, HTMLElement | null>>({});
-  const [activeHighlightEl, setActiveHighlightEl] = useState<HTMLElement | null>(null);
   const [activeMarkId, setActiveMarkId] = useState<string | null>(null);
+  const pendingDecisionsRef = useRef(new Set<number>());
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => { mountedRef.current = false; };
+  }, []);
 
   // We need the root ref on the main container
   const mainContainerRef = useRef<HTMLDivElement>(null);
@@ -120,24 +127,6 @@ export function ReviewStage({
   const pageContainerRef = useRef<HTMLDivElement>(null);
   const activeIssue = issues.find((i) => i.id === activeIssueId);
 
-  // Keep leader line element in sync
-  useEffect(() => {
-    if (activeRightTab === "automated" && activeIssueId) {
-      const timer = setTimeout(() => {
-        const el = document.getElementById(`issue-box-${activeIssueId}`);
-        setActiveHighlightEl(el);
-      }, 50);
-      return () => clearTimeout(timer);
-    } else if (activeRightTab === "manual" && activeMarkId) {
-      const timer = setTimeout(() => {
-        const el = document.getElementById(`mark-box-${activeMarkId}`);
-        setActiveHighlightEl(el);
-      }, 50);
-      return () => clearTimeout(timer);
-    } else {
-      setActiveHighlightEl(null);
-    }
-  }, [activeIssueId, activeMarkId, activeRightTab, currentPage, issues, customMarks]);
 
   const handleOnlineSearch = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -173,8 +162,8 @@ export function ReviewStage({
     if (!pageContainerRef.current) return;
 
     const rect = pageContainerRef.current.getBoundingClientRect();
-    const x = ((e.clientX - rect.left) / rect.width) * 100;
-    const y = ((e.clientY - rect.top) / rect.height) * 100;
+    const x = Math.max(0, Math.min(100, ((e.clientX - rect.left) / rect.width) * 100));
+    const y = Math.max(0, Math.min(100, ((e.clientY - rect.top) / rect.height) * 100));
 
     setDrawingStart({ x, y });
     setDrawingCurrent({ x, y });
@@ -186,8 +175,8 @@ export function ReviewStage({
     if (!isDrawing || !drawingStart || !pageContainerRef.current) return;
 
     const rect = pageContainerRef.current.getBoundingClientRect();
-    const x = ((e.clientX - rect.left) / rect.width) * 100;
-    const y = ((e.clientY - rect.top) / rect.height) * 100;
+    const x = Math.max(0, Math.min(100, ((e.clientX - rect.left) / rect.width) * 100));
+    const y = Math.max(0, Math.min(100, ((e.clientY - rect.top) / rect.height) * 100));
 
     setDrawingCurrent({ x, y });
   };
@@ -207,8 +196,9 @@ export function ReviewStage({
 
     const x = Math.min(drawingStart.x, drawingCurrent.x);
     const y = Math.min(drawingStart.y, drawingCurrent.y);
-    const finalW = Math.max(2, w);
-    const finalH = Math.max(2, h);
+    const finalW = Math.min(100 - x, Math.max(2, w));
+    const finalH = Math.min(100 - y, Math.max(2, h));
+    if (finalW <= 0 || finalH <= 0) return;
 
     // Compute the viewport-absolute bounding box of the drawn selection so
     // the popup portal can use fixed positioning (never clipped by overflow).
@@ -231,7 +221,7 @@ export function ReviewStage({
     if (!pendingSelection || !newCommentText.trim()) return;
 
     const newMark: CustomMark = {
-      id: `mark-${Date.now()}`,
+      id: `mark-${crypto.randomUUID()}`,
       type: activeTool === "select" ? "highlight" : (activeTool as "circle" | "square"),
       x: pendingSelection.x,
       y: pendingSelection.y,
@@ -252,33 +242,26 @@ export function ReviewStage({
     setCustomMarks((prev) => prev.filter((m) => m.id !== id));
   };
 
-  const handleResolve = async (issueId: number) => {
+  const handleStatus = async (issueId: number, status: "open" | "accepted" | "dismissed") => {
     const issue = issues.find((item) => item.id === issueId);
-    if (!issue) return;
+    if (!issue || pendingDecisionsRef.current.has(issueId)) return;
+    pendingDecisionsRef.current.add(issueId);
+    const matches = (item: ProofreaderIssue) => issue.backendUid
+      ? item.backendUid === issue.backendUid
+      : item.id === issueId && item.originalText === issue.originalText && item.page === issue.page;
     setIssues((prev) =>
-      prev.map((i) => (i.id === issueId ? { ...i, resolved: true } : i))
+      prev.map((item) => matches(item) ? { ...item, resolved: status === "accepted", ignored: status === "dismissed" } : item)
     );
     try {
-      await onIssueStatus?.(issue, "accepted");
-      goToNextIssue(issueId);
+      await onIssueStatus?.(issue, status);
+      if (mountedRef.current && status !== "open") goToNextIssue(issueId);
     } catch (error: any) {
-      setIssues((prev) => prev.map((i) => (i.id === issueId ? { ...i, resolved: false } : i)));
-      window.alert(error.message || "Could not save this review decision");
-    }
-  };
-
-  const handleIgnore = async (issueId: number) => {
-    const issue = issues.find((item) => item.id === issueId);
-    if (!issue) return;
-    setIssues((prev) =>
-      prev.map((i) => (i.id === issueId ? { ...i, ignored: true } : i))
-    );
-    try {
-      await onIssueStatus?.(issue, "dismissed");
-      goToNextIssue(issueId);
-    } catch (error: any) {
-      setIssues((prev) => prev.map((i) => (i.id === issueId ? { ...i, ignored: false } : i)));
-      window.alert(error.message || "Could not save this review decision");
+      if (mountedRef.current) {
+        setIssues((prev) => prev.map((item) => matches(item) ? { ...item, resolved: issue.resolved, ignored: issue.ignored } : item));
+        window.alert(error.message || "Could not save this review decision");
+      }
+    } finally {
+      pendingDecisionsRef.current.delete(issueId);
     }
   };
 
@@ -307,8 +290,8 @@ export function ReviewStage({
       if (target?.matches("input, textarea, select, [contenteditable='true']")) return;
       if (event.key === "ArrowLeft") setCurrentPage(Math.max(1, currentPage - 1));
       if (event.key === "ArrowRight") setCurrentPage(Math.min(totalPages, currentPage + 1));
-      if ((event.key === "a" || event.key === "A") && activeIssueId) void handleResolve(activeIssueId);
-      if ((event.key === "x" || event.key === "X") && activeIssueId) void handleIgnore(activeIssueId);
+      if ((event.key === "a" || event.key === "A") && activeIssueId) void handleStatus(activeIssueId, "accepted");
+      if ((event.key === "x" || event.key === "X") && activeIssueId) void handleStatus(activeIssueId, "dismissed");
       if (event.key === "j" || event.key === "k") {
         const index = issues.findIndex((item) => item.id === activeIssueId);
         const nextIndex = event.key === "j" ? Math.min(issues.length - 1, index + 1) : Math.max(0, index - 1);
@@ -325,6 +308,28 @@ export function ReviewStage({
   // Handlers intentionally refresh with the current review state on each change.
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeIssueId, currentPage, issues, totalPages]);
+
+  // Keep the active issue's sidebar card and canvas box in view (retrying briefly
+  // because the PDF page may still be rendering after a page change).
+  useEffect(() => {
+    if (!activeIssueId) return undefined;
+    let tries = 0;
+    const timer = setInterval(() => {
+      tries += 1;
+      const card = document.getElementById(`sidebar-issue-${activeIssueId}`);
+      const box = document.getElementById(`issue-box-${activeIssueId}`);
+      if (card) card.scrollIntoView({ block: "nearest", behavior: "smooth" });
+      if (box) {
+        scrollToIssueBox(activeIssueId);
+        clearInterval(timer);
+      } else if (tries >= 10) {
+        clearInterval(timer);
+      }
+    }, 150);
+    return () => clearInterval(timer);
+  // scrollToIssueBox is a stable-in-effect helper that only reads the DOM.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeIssueId, currentPage]);
 
   /** Scroll only the PDF canvas viewport to center the issue box — never scrolls the outer layout. */
   const scrollToIssueBox = (issueId: number) => {
@@ -366,7 +371,7 @@ export function ReviewStage({
     } else {
       setFileUrl(null);
     }
-  }, [selectedFile]);
+  }, [selectedFile?.rawFile]);
 
   const onDocumentLoadSuccess = ({ numPages }: { numPages: number }) => {
     setNumPages(numPages);
@@ -381,8 +386,8 @@ export function ReviewStage({
       {(activeIssueId && activeRightTab === "automated") || (activeMarkId && activeRightTab === "manual") ? (
         <LeaderLine
           rootRef={mainContainerRef}
-          fromElement={activeHighlightEl}
-          toElement={activeRightTab === "automated" ? cardRefs.current[activeIssueId!] : markCardRefs.current[activeMarkId!]}
+          fromId={activeRightTab === "automated" ? `issue-box-${activeIssueId}` : `mark-box-${activeMarkId}`}
+          toId={activeRightTab === "automated" ? `sidebar-issue-${activeIssueId}` : `sidebar-mark-${activeMarkId}`}
           color={activeRightTab === "automated" ? "#ef4444" : "#a855f7"} // Red for AI, Purple for Manual
         />
       ) : null}
@@ -525,10 +530,12 @@ export function ReviewStage({
 
 
             {/* Render ALL issue bbox overlays for current page */}
-            {!isRefiningIssues && issues.filter(issue =>
+            {issues.filter(issue =>
               !issue.ignored &&
               (issue.page ?? issue.pageIndex) === currentPage &&
-              issue.bbox
+              issue.bbox &&
+              Number.isFinite(issue.bbox.x) && Number.isFinite(issue.bbox.y) &&
+              Number.isFinite(issue.bbox.w) && Number.isFinite(issue.bbox.h)
             ).map((issue) => {
               const isActive = issue.id === activeIssueId;
               const isResolved = issue.resolved;
@@ -713,6 +720,11 @@ export function ReviewStage({
           <div className="flex-grow flex flex-col min-h-0">
             {/* Automated Issues Queue */}
             <div className="flex-1 overflow-y-auto min-h-0 custom-scrollbar">
+              {analysisWarnings.length > 0 && (
+                <div role="status" className="m-4 rounded-xl border border-amber-200 bg-amber-50 p-3 text-xs text-amber-800">
+                  {analysisWarnings.map((warning, index) => <p key={index}>{warning}</p>)}
+                </div>
+              )}
               <IssueList 
                 issues={issues}
                 selectedId={activeIssueId}
@@ -725,20 +737,7 @@ export function ReviewStage({
                   }
                 }}
                 onStatus={(id, status) => {
-                  if (status === "accepted") {
-                    void handleResolve(id);
-                  } else if (status === "dismissed") {
-                    void handleIgnore(id);
-                  } else if (status === "open") {
-                    // Reset: undo resolved/ignored locally and tell backend
-                    setIssues((prev) =>
-                      prev.map((i) => (i.id === id ? { ...i, resolved: false, ignored: false } : i))
-                    );
-                    const issue = issues.find(i => i.id === id);
-                    if (issue && onIssueStatus) {
-                      onIssueStatus(issue, "open" as any);
-                    }
-                  }
+                  void handleStatus(id, status);
                 }}
                 cardRefs={cardRefs}
               />

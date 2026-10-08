@@ -1,22 +1,31 @@
 import { randomUUID, createHash } from "crypto";
 import { NextResponse } from "next/server";
-import { assertSameOrigin, apiError, HttpError } from "@/server/http.js";
-import { safePdfName } from "@/server/storage.js";
+import { assertSameOrigin, apiError, HttpError, readJsonBody } from "@/server/http.js";
+import { safePdfName, MAX_PDF_BYTES, MAX_PDF_PARTS } from "@/server/storage.js";
 
 export const runtime = "nodejs";
 
 export async function POST(request: Request) {
   try {
     assertSameOrigin(request);
-    const { filename, contentType, fileSize, partIndex, baseId } = await request.json();
-    if (!filename || !String(filename).toLowerCase().endsWith(".pdf")) {
+    const { filename, contentType, fileSize, partIndex, baseId } = await readJsonBody(request);
+    if (typeof filename !== "string" || !filename.toLowerCase().endsWith(".pdf")) {
       throw new HttpError(400, "A PDF filename is required");
     }
     if (contentType && contentType !== "application/pdf") {
       throw new HttpError(400, "Only PDF uploads are allowed");
     }
-    if (Number(fileSize || 0) > 500 * 1024 * 1024) {
-      throw new HttpError(413, "PDF exceeds the 500 MB limit");
+    if (!Number.isSafeInteger(fileSize) || fileSize <= 0) {
+      throw new HttpError(400, "A positive PDF upload size is required");
+    }
+    if (fileSize > MAX_PDF_BYTES) {
+      throw new HttpError(413, "PDF exceeds the 250 MB limit");
+    }
+    if (baseId !== undefined && (typeof baseId !== "string" || !/^[A-Za-z\d_-]{1,80}$/.test(baseId))) {
+      throw new HttpError(400, "Invalid upload identity");
+    }
+    if (partIndex !== undefined && (!Number.isSafeInteger(partIndex) || partIndex < 0 || partIndex >= MAX_PDF_PARTS)) {
+      throw new HttpError(400, "Invalid upload part index");
     }
 
     const cloudName = process.env.CLOUDINARY_CLOUD_NAME;

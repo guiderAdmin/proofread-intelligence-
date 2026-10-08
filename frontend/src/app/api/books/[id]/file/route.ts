@@ -1,67 +1,95 @@
 import { NextResponse } from "next/server";
 import Book from "@/server/models/Book.js";
 import { connectDb } from "@/server/db.js";
-import { apiError, HttpError } from "@/server/http.js";
+import { apiError, HttpError, validateBookId } from "@/server/http.js";
+import { pdfContentDisposition } from "@/server/validation.js";
+import { MAX_PDF_BYTES, pdfObjectUrl, validatePdfParts } from "@/server/storage.js";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 export async function GET(_request: Request, { params }: { params: { id: string } }) {
   try {
+    validateBookId(params.id);
     await connectDb();
     const book: any = await Book.findById(params.id).lean();
     if (!book) throw new HttpError(404, "Proofread not found");
 
     // Cloudinary-stored PDF (Vercel deployment)
     if (book.cloudinaryPdfKey) {
-      const cloudName = process.env.CLOUDINARY_CLOUD_NAME;
-      if (!cloudName) throw new HttpError(500, "Cloudinary not configured");
-      
-      // If it's a single file, it's just part0 essentially, or we use the base key
-      // We'll stitch it dynamically on the fly and stream it to the browser to avoid CORS issues with 302 redirects
+      // Read one chunk per pull so the browser's backpressure bounds memory.
+      // The old pull enqueued an entire multipart file even after cancellation.
       let currentPart = 0;
-      const totalParts = book.pdfParts && book.pdfParts > 0 ? book.pdfParts : 1;
+      let totalBytes = 0;
+      const totalParts = validatePdfParts(book.pdfParts ?? 1);
       const objectKey = book.cloudinaryPdfKey;
+      const abort = new AbortController();
+      const stop = () => abort.abort();
+      _request.signal.addEventListener("abort", stop, { once: true });
+      if (_request.signal.aborted) stop();
+      let timeout: ReturnType<typeof setTimeout> | null = null;
+      const cleanUp = () => {
+        if (timeout) clearTimeout(timeout);
+        _request.signal.removeEventListener("abort", stop);
+      };
+      const fetchPart = async (part: number) => {
+        if (timeout) clearTimeout(timeout);
+        timeout = setTimeout(() => abort.abort(), 60_000);
+        const response = await fetch(pdfObjectUrl(objectKey, part, totalParts), { cache: "no-store", signal: abort.signal });
+        if (!response.ok || !response.body) {
+          await response.body?.cancel().catch(() => {});
+          throw new HttpError(502, `Unable to retrieve PDF part ${part + 1}`);
+        }
+        return response.body.getReader();
+      };
+      // Check the first part before committing HTTP 200, so a missing original
+      // produces an actionable API error instead of a broken PDF response.
+      let reader: ReadableStreamDefaultReader<Uint8Array>;
+      try {
+        reader = await fetchPart(0);
+      } catch (error) {
+        cleanUp();
+        throw error;
+      }
 
       const stream = new ReadableStream({
         async pull(controller) {
-          if (currentPart >= totalParts) {
-            controller.close();
-            return;
-          }
-          let partKey = objectKey;
-          if (book.pdfParts && book.pdfParts > 1) {
-            partKey = `${objectKey}.part${currentPart}`;
-          }
-          const downloadKey = partKey.toLowerCase().endsWith(".pdf") ? partKey : `${partKey}.pdf`;
-          const url = `https://res.cloudinary.com/${cloudName}/raw/upload/${downloadKey}`;
-
-          const res = await fetch(url, { cache: "no-store" });
-          if (!res.ok) {
-            controller.error(new Error(`Failed to fetch PDF part ${currentPart}: ${res.statusText}`));
-            return;
-          }
-
-          if (res.body) {
-            const reader = res.body.getReader();
-            try {
-              while (true) {
-                const { done, value } = await reader.read();
-                if (done) break;
+          try {
+            for (;;) {
+              const { done, value } = await reader.read();
+              if (!done) {
+                totalBytes += value.byteLength;
+                if (totalBytes > MAX_PDF_BYTES) throw new HttpError(413, "PDF exceeds the 250 MB limit");
                 controller.enqueue(value);
+                return;
               }
-            } finally {
               reader.releaseLock();
+              currentPart += 1;
+              if (currentPart >= totalParts) {
+                cleanUp();
+                controller.close();
+                return;
+              }
+              reader = await fetchPart(currentPart);
             }
+          } catch (error) {
+            cleanUp();
+            abort.abort();
+            await reader.cancel().catch(() => {});
+            controller.error(error);
           }
-          currentPart++;
-        }
+        },
+        async cancel() {
+          cleanUp();
+          abort.abort();
+          await reader.cancel().catch(() => {});
+        },
       });
 
       return new Response(stream, {
         headers: {
           "Content-Type": "application/pdf",
-          "Content-Disposition": `inline; filename="${String(book.originalName || "document.pdf").replace(/["\r\n]/g, "_")}"`,
+          "Content-Disposition": pdfContentDisposition(book.originalName),
           "Cache-Control": "private, no-store",
         },
       });
@@ -75,7 +103,7 @@ export async function GET(_request: Request, { params }: { params: { id: string 
     return new Response(body, {
       headers: {
         "Content-Type": "application/pdf",
-        "Content-Disposition": `inline; filename="${String(book.originalName || "document.pdf").replace(/["\\r\\n]/g, "_")}"`,
+        "Content-Disposition": pdfContentDisposition(book.originalName),
         "Cache-Control": "private, no-store",
       },
     });

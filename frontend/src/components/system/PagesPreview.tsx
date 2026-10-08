@@ -85,7 +85,7 @@ export function PagesPreview({
       setFileUrl(null);
       setDetectedPages(null);
     }
-  }, [selectedFile]);
+  }, [selectedFile?.rawFile]);
 
   const handleDocumentLoadSuccess = ({ numPages }: { numPages: number }) => {
     setDetectedPages(numPages);

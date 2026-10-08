@@ -17,13 +17,13 @@ An advanced, AI-powered document proofreading platform built with Next.js, Tailw
 - **Database**: MongoDB (Mongoose)
 - **AI Processing**: Google Gemini API
 - **PDF Rendering**: React-PDF / pdf.js
-- **Storage**: Cloudinary (for secure, temporary PDF & image storage)
+- **Storage**: Cloudinary (saved source PDFs and rendered page images)
 
 ## Getting Started
 
 ### Prerequisites
 
-You will need the following environment variables. Create a `.env.local` file in the root directory:
+Run commands from `frontend/` and create `.env.local` there, using `.env.example` as the starting point:
 
 ```env
 # Database
@@ -40,6 +40,7 @@ CLOUDINARY_CLOUD_NAME=your_cloudinary_cloud_name
 
 # App Authentication (Basic Auth for early access)
 PROOFDESK_BASIC_PASSWORD=your_secure_password
+PROOFDESK_BASIC_USER=your_user_name
 ```
 
 ### Installation
@@ -58,14 +59,11 @@ PROOFDESK_BASIC_PASSWORD=your_secure_password
 
 ## Deployment
 
-This platform is fully optimized for **Vercel** deployment.
+Run `npm run build` and `npm start` for production. Each browser worker request now awaits one durable page job before returning. On Vercel, the open browser session drives worker requests; saved progress can be resumed after closing it. No cron configuration or scheduler endpoint is provided. The optional `npm run worker` is for persistent Node hosts only. Vercel worker routes set `maxDuration=300`; enable Fluid compute and check the host duration setting. Status polling does not start model work. See [deployment and reliability verification](docs/RELIABILITY-AUDIT.md).
 
-1. Connect your GitHub repository to Vercel.
-2. In the Vercel dashboard, navigate to **Settings > Environment Variables**.
-3. Add all the environment variables from your `.env.local` file.
-4. Trigger the deployment.
+This checkout uses `next start` for production. Keep the build directory and `public/` assets available on the deployed host.
 
-Vercel will automatically run `npm run build` and provision the serverless Edge Functions for the backend queue and API routes.
+Scanned documents use a local Tesseract executable when available, with the existing `tesseract.js` backend as the fallback. See [architecture and OCR configuration](docs/ARCHITECTURE.md) for storage, worker, coordinate, and deployment details. Run `npm test` for the isolated regression suite.
 
 ## License
 

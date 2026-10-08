@@ -24,9 +24,9 @@ export function DashboardStage({ data, onReviewIssue, onLaunchReview, onExport, 
     issues.forEach(issue => {
       if (issue.resolved || issue.ignored) return;
       const cat = (issue.category || "").toLowerCase();
-      if (cat.includes("grammar") || cat.includes("spell") || cat.includes("syntax")) grammarCount++;
-      else if (cat.includes("format") || cat.includes("layout") || cat.includes("pedagog") || cat.includes("structure")) pedagogyCount++;
-      else if (cat.includes("fact") || cat.includes("accura")) factCount++;
+      if (cat.includes("grammar") || cat.includes("spell") || cat.includes("syntax") || cat.includes("punctuation") || cat.includes("typograph") || cat.includes("word")) grammarCount++;
+      else if (cat.includes("format") || cat.includes("layout") || cat.includes("pedagog") || cat.includes("structure") || cat.includes("align") || cat.includes("curricul")) pedagogyCount++;
+      else if (cat.includes("fact") || cat.includes("accura") || cat.includes("logic") || cat.includes("math") || cat.includes("reason")) factCount++;
       else styleCount++;
     });
 
@@ -35,25 +35,25 @@ export function DashboardStage({ data, onReviewIssue, onLaunchReview, onExport, 
     return [
       { 
         label: "Syntax Health", score: calc(grammarCount), 
-        status: grammarCount === 0 ? "Verified" : `${grammarCount} Alert${grammarCount > 1 ? "s" : ""}`, 
+        status: grammarCount === 0 ? "No open findings" : `${grammarCount} Alert${grammarCount > 1 ? "s" : ""}`,
         icon: FileSearch, color: "text-brand-600", bg: "bg-brand-50 border-brand-100",
         barColor: "bg-brand-500"
       },
       { 
         label: "Curriculum Alignment", score: calc(pedagogyCount), 
-        status: pedagogyCount === 0 ? "Compliant" : `${pedagogyCount} Alert${pedagogyCount > 1 ? "s" : ""}`, 
+        status: pedagogyCount === 0 ? "No open findings" : `${pedagogyCount} Alert${pedagogyCount > 1 ? "s" : ""}`,
         icon: ShieldCheck, color: "text-blue-600", bg: "bg-blue-50 border-blue-100",
         barColor: "bg-blue-500"
       },
       { 
         label: "Fact Accuracy", score: calc(factCount), 
-        status: factCount === 0 ? "Verified" : `${factCount} Alert${factCount > 1 ? "s" : ""}`, 
+        status: factCount === 0 ? "No open findings" : `${factCount} Alert${factCount > 1 ? "s" : ""}`,
         icon: Database, color: "text-emerald-600", bg: "bg-emerald-50 border-emerald-100",
         barColor: "bg-emerald-500"
       },
       { 
         label: "Style & Consistency", score: calc(styleCount), 
-        status: styleCount === 0 ? "Consistent" : `${styleCount} Alert${styleCount > 1 ? "s" : ""}`, 
+        status: styleCount === 0 ? "No open findings" : `${styleCount} Alert${styleCount > 1 ? "s" : ""}`,
         icon: AlertTriangle, color: "text-amber-600", bg: "bg-amber-50 border-amber-100",
         barColor: "bg-amber-500"
       },
@@ -67,7 +67,7 @@ export function DashboardStage({ data, onReviewIssue, onLaunchReview, onExport, 
     ? selectedFile.subject
     : Array.from(new Set((data?.perPage || []).map((p: any) => p.subjectKey).filter(Boolean))).join(', ') || "GENERAL";
 
-  const totalPagesScanned = data?.pagesReviewed || data?.pagesExpected || 0;
+  const totalPagesScanned = data?.pagesReviewed ?? 0;
   const pendingVisualsCount = data?.visualReviewPendingCount ?? 0;
 
   return (
@@ -81,7 +81,7 @@ export function DashboardStage({ data, onReviewIssue, onLaunchReview, onExport, 
             <span>Diagnostic Audit Scorecard</span>
           </div>
           <h2 className="text-xl font-extrabold text-slate-900 tracking-tight leading-tight">Curriculum Intelligence Report</h2>
-          <p className="text-xs text-slate-500 mt-0.5 font-medium">Automated validation scorecard compiled from saved page-level evidence.</p>
+          <p className="text-xs text-slate-500 mt-0.5 font-medium">Scores summarize recorded findings. Review the evidence and any incomplete pages.</p>
         </div>
         <div className="flex items-center gap-3 shrink-0 self-start md:self-auto">
           <button
@@ -165,9 +165,9 @@ export function DashboardStage({ data, onReviewIssue, onLaunchReview, onExport, 
                           <CheckCircle2 className="h-5 w-5" />
                         </div>
                         <div>
-                          <p className="font-bold text-slate-800 text-xs">Perfect Compliance</p>
+                          <p className="font-bold text-slate-800 text-xs">No findings recorded</p>
                           <p className="text-[11px] font-medium text-slate-400 max-w-xs mx-auto mt-0.5">
-                            No critical alerts or pedagogical anomalies were flagged.
+                            {data?.success ? "Analysis completed. Review the document before publication." : "Analysis is incomplete. Check pending pages before reviewing the result."}
                           </p>
                         </div>
                       </div>
@@ -237,7 +237,7 @@ export function DashboardStage({ data, onReviewIssue, onLaunchReview, onExport, 
               <div className="p-2.5 bg-slate-50/80 rounded-xl border-l-4 border-l-emerald-500 border-y border-r border-slate-200/70 hover:bg-white transition-colors">
                 <p className="text-[9px] font-bold text-emerald-600 uppercase tracking-wider mb-0.5">Audit Coverage</p>
                 <p className="font-bold text-slate-800 text-xs">{totalPagesScanned} Pages</p>
-                <p className="text-[10px] text-slate-500 mt-0.5 font-medium">100% text layer parsed & validated.</p>
+                <p className="text-[10px] text-slate-500 mt-0.5 font-medium">{totalPagesScanned} of {data?.pagesExpected ?? 0} pages completed.</p>
               </div>
 
               {/* Insight Card 3 */}
@@ -245,7 +245,7 @@ export function DashboardStage({ data, onReviewIssue, onLaunchReview, onExport, 
                 <p className="text-[9px] font-bold text-blue-600 uppercase tracking-wider mb-0.5">Visual Reviews</p>
                 <p className="font-bold text-slate-800 text-xs">{pendingVisualsCount} Pages Pending</p>
                 <p className="text-[10px] text-slate-500 mt-0.5 font-medium">
-                  {pendingVisualsCount > 0 ? "Manual visual validation recommended." : "No visual layout issues detected."}
+                  {pendingVisualsCount > 0 ? "Some pages are incomplete or have evidence warnings." : "Saved findings are available in the review canvas."}
                 </p>
               </div>
             </div>
