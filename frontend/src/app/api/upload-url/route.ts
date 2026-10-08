@@ -28,14 +28,6 @@ export async function POST(request: Request) {
       throw new HttpError(400, "Invalid upload part index");
     }
 
-    const cloudName = process.env.CLOUDINARY_CLOUD_NAME;
-    const apiKey = process.env.CLOUDINARY_API_KEY;
-    const apiSecret = process.env.CLOUDINARY_API_SECRET;
-
-    if (!cloudName || !apiKey || !apiSecret) {
-      throw new HttpError(500, "Cloudinary upload storage is not configured");
-    }
-
     const uuid = baseId || randomUUID();
     let publicId = `proofreader_assets/pdf_${uuid}_${safePdfName(filename).replace(/\.pdf$/i, '')}`;
     if (partIndex !== undefined) {
@@ -43,17 +35,13 @@ export async function POST(request: Request) {
     }
     const timestamp = Math.round(new Date().getTime() / 1000);
     
-    // Cloudinary expects parameters to be sorted alphabetically when signing
-    const paramsToSign = `public_id=${publicId}&timestamp=${timestamp}${apiSecret}`;
-    const signature = createHash("sha256").update(paramsToSign).digest("hex");
-
     return NextResponse.json({ 
-      uploadUrl: `https://api.cloudinary.com/v1_1/${cloudName}/raw/upload`,
-      signature, 
+      uploadUrl: `${process.env.NEXT_PUBLIC_BASE_PATH || ""}/api/upload-local`,
+      signature: "local", 
       timestamp,
-      apiKey,
+      apiKey: "local",
       publicId,
-      objectKey: publicId // Cloudinary public_id (no extension for raw resources)
+      objectKey: publicId
     });
   } catch (error) {
     return apiError(error, "Unable to prepare the PDF upload");

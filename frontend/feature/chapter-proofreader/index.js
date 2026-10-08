@@ -7,4 +7,5 @@ export {
   refreshEvidenceIndex,
   refreshChapterAnalysisStats,
   seedChapterContexts,
+  buildAllChapterContexts,
 } from "./server/service.js";

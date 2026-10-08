@@ -21,6 +21,7 @@ const chapterContextSchema = new mongoose.Schema(
     },
     memory: { type: mongoose.Schema.Types.Mixed, default: () => ({}) },
     compactContext: { type: String, default: "" },
+    customContextOverride: { type: String, default: "" },
     sourceChars: { type: Number, default: 0 },
     tokensUsed: { type: Number, default: 0 },
     error: { type: String, default: "" },

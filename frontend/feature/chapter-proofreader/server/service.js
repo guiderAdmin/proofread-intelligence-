@@ -1,10 +1,12 @@
 import { structureFromEvidence, localChapterContext } from "./index-evidence.js";
 import crypto from "crypto";
 import fs from "fs/promises";
+import path from "path";
 import Book from "../../../src/server/models/Book.js";
 import Page from "../../../src/server/models/Page.js";
 import { extractPageText, withPdf } from "../../../src/server/services/pdf.js";
 import { extractBookStructure } from "../../../src/server/services/structure.js";
+import { storageRoot } from "../../../src/server/storage.js";
 import { getClient, resolveModel, waitForGeminiSlot } from "../../../src/server/services/gemini.js";
 import ChapterContext from "./ChapterContext.js";
 
@@ -574,6 +576,9 @@ function list(values, limit = 8) {
 }
 
 function renderChapterContext(record, pageNumber) {
+  if (record.customContextOverride && record.customContextOverride.trim() !== "") {
+    return record.customContextOverride;
+  }
   const memory = record.memory || {};
   const characters = (memory.characters || []).slice(0, 8).map((item) =>
     `${normalize(item.name)}: ${normalize(item.role)}; ${normalize(item.traitsAndFacts)}; relations: ${normalize(item.relationships)}; pages ${(item.pages || []).join(", ")}`
@@ -645,8 +650,45 @@ async function buildChapterContext({ book, chapter, record, pdfPath, deadlineAt 
   record.status = "ready";
   record.analyzedAt = new Date();
   await record.save();
+
+  // Save the context locally so the user can see what it looks like
+  try {
+    const targetDir = path.join(storageRoot(), String(book._id));
+    await fs.mkdir(targetDir, { recursive: true }).catch(() => {});
+    const memoryFile = path.join(targetDir, `chapter-${chapter.chapterKey}-memory.json`);
+    const memoryData = {
+      chapterTitle: record.title,
+      startPage: record.startPage,
+      endPage: record.endPage,
+      rawMemory: memory,
+      compiledContextPrompt: record.compactContext
+    };
+    await fs.writeFile(memoryFile, JSON.stringify(memoryData, null, 2));
+  } catch (err) {
+    console.error(`Failed to write local chapter memory for ${chapter.chapterKey}`, err);
+  }
+
   await refreshChapterAnalysisStats(book._id);
   return record;
+}
+
+export async function buildAllChapterContexts(book, pdfPath) {
+  const allPages = await refreshEvidenceIndex(book);
+  if (!book.structure?.chapters?.length) return;
+  
+  const promises = book.structure.chapters.map(async (chapter) => {
+    let record = await ChapterContext.findOne({ bookId: book._id, chapterKey: chapter.chapterKey });
+    if (!record) return;
+    if (record.status === "ready") return;
+    
+    try {
+      await buildChapterContext({ book, chapter, record, pdfPath, deadlineAt: Date.now() + 10 * 60 * 1000 });
+    } catch (err) {
+      console.error(`Failed to build context for ${chapter.chapterKey}:`, err);
+    }
+  });
+  
+  await Promise.allSettled(promises);
 }
 
 export async function refreshEvidenceIndex(book) {
@@ -669,7 +711,7 @@ export async function getChapterContextForAnalysis({ book, pageNumber, pdfPath, 
   const total=chapter.endPage-chapter.startPage+1;
   let record=await ChapterContext.findOne({bookId:book._id,chapterKey:chapter.chapterKey});
   // Never start unawaited model work. Partial chapters use explicit source evidence.
-  if(allowBuild && record && record.status==="pending" && chapter.confidence>=.6 && indexed.length===total) {
+  if(allowBuild && record && record.status==="pending" && indexed.length===total) {
     const key=`${book._id}:${chapter.chapterKey}:${record.contentHash}`;
     if(!activeBuilds.has(key))activeBuilds.set(key,buildChapterContext({book,chapter,record,pdfPath,deadlineAt})
       .catch(async error=>{record.status="error";record.error=normalize(error?.message||error).slice(0,1000);await record.save().catch(()=>{});return null;})

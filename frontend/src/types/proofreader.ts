@@ -56,4 +56,5 @@ export interface ProofreaderResponse {
   severityCounts: SeverityCounts;
   issues: ProofreaderIssue[];
   perPage?: any[];
+  model?: string;
 }

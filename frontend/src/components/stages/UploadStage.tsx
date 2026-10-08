@@ -8,7 +8,7 @@ interface SavedBookSummary {
   title: string;
   originalName?: string;
   pageCount: number;
-  status: "queued" | "processing" | "paused" | "done" | "error";
+  status: "queued" | "context_approval" | "processing" | "paused" | "done" | "error";
   progress?: { done?: number; failed?: number };
   stats?: { issues?: number };
   createdAt?: string;
@@ -232,9 +232,11 @@ export function UploadStage({ selectedFile, onFileSelect, onStartAnalysis, saved
                         ? "bg-emerald-50 text-emerald-700 border-emerald-200"
                         : book.status === "error"
                           ? "bg-red-50 text-red-700 border-red-200"
-                          : "bg-amber-50 text-amber-700 border-amber-200"
+                          : book.status === "context_approval"
+                            ? "bg-brand-50 text-brand-700 border-brand-200"
+                            : "bg-amber-50 text-amber-700 border-amber-200"
                     }`}>
-                      {book.status}
+                      {book.status === "context_approval" ? "Context Approval" : book.status}
                     </span>
                     <button
                       onClick={(e) => {

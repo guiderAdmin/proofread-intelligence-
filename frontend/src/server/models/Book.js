@@ -24,7 +24,7 @@ const bookSchema = new mongoose.Schema(
     proofreadingInstructions: { type: String, default: "", maxlength: 2000 },
     status: {
       type: String,
-      enum: ["queued", "processing", "paused", "done", "error"],
+      enum: ["queued", "context_approval", "processing", "paused", "done", "error"],
       default: "queued",
     },
     progress: {
@@ -47,7 +47,7 @@ const bookSchema = new mongoose.Schema(
     },
     chapterAnalysis: {
       type: mongoose.Schema.Types.Mixed,
-      default: () => ({ status: "pending", version: "", chapters: 0, tokensUsed: 0 }),
+      default: () => ({ status: "pending", version: "", chapters: 0, tokensUsed: 0, contextApproved: false }),
     },
     customMarks: {
       type: mongoose.Schema.Types.Mixed,

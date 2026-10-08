@@ -3,7 +3,7 @@ import Book from "@/server/models/Book.js";
 import Page from "@/server/models/Page.js";
 import { connectDb } from "@/server/db.js";
 import { assertSameOrigin, apiError, HttpError, readJsonBody } from "@/server/http.js";
-import { tempPdfPath, deleteUploadObject, downloadPdfObject, validateUploadKey, validatePdfParts } from "@/server/storage.js";
+import { bookPdfPath, deleteUploadObject, downloadPdfObject, validateUploadKey, validatePdfParts } from "@/server/storage.js";
 import { getPageCount } from "@/server/services/pdf.js";
 import { enqueueBook, removeBookFiles, serializeBook } from "@/server/services/queue.js";
 import { DEFAULT_MODEL, hasAnyKey, resolveModel } from "@/server/services/gemini.js";
@@ -49,8 +49,8 @@ export async function POST(request: NextRequest) {
       status: "queued",
     });
 
-    // Download to /tmp — writable on both Vercel and persistent servers
-    const destination = tempPdfPath(book._id);
+    // Download to local storage under the book's session directory
+    const destination = bookPdfPath(book._id, book.originalName);
     await downloadPdfObject(objectKey, totalParts, destination);
     book.filePath = destination;
     book.pageCount = await getPageCount(destination);

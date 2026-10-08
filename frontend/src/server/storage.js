@@ -93,47 +93,16 @@ export async function downloadPdfObject(objectKey, pdfParts, destination) {
 
 async function downloadPdfToFile(objectKey, parts, destination) {
   await fsp.mkdir(path.dirname(destination), { recursive: true });
-  // Readers must never see a half-downloaded file. Parallel workers share the
-  // completed download; separate processes still publish atomically by rename.
   const staging = `${destination}.${crypto.randomUUID()}.download`;
   let handle;
-  let totalBytes = 0;
-  const downloadSignal = AbortSignal.timeout(60_000);
   try {
     handle = await fsp.open(staging, "wx+", 0o600);
+    const storageDir = storageRoot();
     for (let i = 0; i < parts; i += 1) {
-      const response = await fetch(pdfObjectUrl(objectKey, i, parts), {
-        cache: "no-store", signal: downloadSignal,
-      });
-      if (!response.ok) {
-        await response.body?.cancel().catch(() => {});
-        throw new Error(`Uploaded PDF part ${i} could not be read from storage (HTTP ${response.status})`);
-      }
-      const announcedBytes = Number(response.headers.get("content-length"));
-      if (announcedBytes > MAX_PDF_BYTES - totalBytes) {
-        await response.body?.cancel().catch(() => {});
-        throw new HttpError(413, "PDF exceeds the 250 MB limit");
-      }
-      if (!response.body) throw new Error(`Uploaded PDF part ${i} has no content`);
-      const reader = response.body.getReader();
-      try {
-        for (;;) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          totalBytes += value.byteLength;
-          if (totalBytes > MAX_PDF_BYTES) throw new HttpError(413, "PDF exceeds the 250 MB limit");
-          const buffer = Buffer.from(value);
-          let written = 0;
-          while (written < buffer.length) {
-            const result = await handle.write(buffer, written, buffer.length - written, null);
-            if (!result.bytesWritten) throw new Error("Unable to write the downloaded PDF");
-            written += result.bytesWritten;
-          }
-        }
-      } finally {
-        await reader.cancel().catch(() => {});
-        reader.releaseLock();
-      }
+      const partKey = parts > 1 ? `${objectKey}.part${i}` : objectKey;
+      const partPath = path.join(storageDir, partKey);
+      const buffer = await fsp.readFile(partPath);
+      await handle.write(buffer, 0, buffer.length, null);
     }
     const magic = Buffer.alloc(5);
     await handle.read(magic, 0, 5, 0);
@@ -148,103 +117,34 @@ async function downloadPdfToFile(objectKey, parts, destination) {
 }
 
 /**
- * Upload a rendered JPEG page image buffer to Cloudinary.
- * Returns the public secure_url for permanent storage in MongoDB.
+ * Upload a rendered JPEG page image buffer locally.
+ * Returns the public url for permanent storage in MongoDB.
  */
 export async function uploadPageImage(jpegBuffer, bookId, pageNumber) {
-  const cloudName = process.env.CLOUDINARY_CLOUD_NAME;
-  const apiKey = process.env.CLOUDINARY_API_KEY;
-  const apiSecret = process.env.CLOUDINARY_API_SECRET;
-  if (!cloudName || !apiKey || !apiSecret) throw new Error("Cloudinary not configured");
-
-  const folder = "proofreader_pages";
-  const publicId = `${bookId}_page_${pageNumber}`;
-  const timestamp = Math.round(Date.now() / 1000);
-
-  // Parameters must be sorted alphabetically before signing
-  const paramsToSign = `folder=${folder}&public_id=${publicId}&timestamp=${timestamp}${apiSecret}`;
-  const signature = crypto.createHash("sha256").update(paramsToSign).digest("hex");
-
-  const form = new FormData();
-  form.append("file", new Blob([jpegBuffer], { type: "image/jpeg" }));
-  form.append("api_key", apiKey);
-  form.append("timestamp", String(timestamp));
-  form.append("signature", signature);
-  form.append("folder", folder);
-  form.append("public_id", publicId);
-
-  const res = await fetch(`https://api.cloudinary.com/v1_1/${encodeURIComponent(cloudName)}/image/upload`, {
-    method: "POST",
-    body: form,
-    signal: AbortSignal.timeout(60_000),
-  });
-
-  if (!res.ok) {
-    const err = await res.text().catch(() => res.statusText);
-    throw new Error(`Cloudinary page image upload failed (${res.status}): ${err}`);
-  }
-
-  const data = await res.json();
-  let imageUrl;
-  try {
-    imageUrl = new URL(data.secure_url);
-  } catch {
-    throw new Error("Cloudinary did not return a valid page image URL");
-  }
-  if (imageUrl.protocol !== "https:" || imageUrl.hostname !== "res.cloudinary.com") {
-    throw new Error("Cloudinary did not return a valid page image URL");
-  }
-  return imageUrl.href;
+  const publicId = `page-${pageNumber}.jpg`;
+  const storageDir = storageRoot();
+  const targetPath = path.join(storageDir, String(bookId), publicId);
+  await fsp.mkdir(path.dirname(targetPath), { recursive: true });
+  await fsp.writeFile(targetPath, jpegBuffer);
+  return `${process.env.NEXT_PUBLIC_BASE_PATH || ""}/api/local-image?id=${encodeURIComponent(String(bookId) + "/" + publicId)}`;
 }
 
-/**
- * Delete a single page image from Cloudinary.
- */
-export async function deletePageImage(bookId, pageNumber, signal = AbortSignal.timeout(30_000)) {
-  const cloudName = process.env.CLOUDINARY_CLOUD_NAME;
-  const apiKey = process.env.CLOUDINARY_API_KEY;
-  const apiSecret = process.env.CLOUDINARY_API_SECRET;
-  if (!cloudName || !apiKey || !apiSecret) return;
-
-  const publicId = `proofreader_pages/${bookId}_page_${pageNumber}`;
-  const timestamp = Math.round(Date.now() / 1000);
-  const paramsToSign = `public_id=${publicId}&timestamp=${timestamp}${apiSecret}`;
-  const signature = crypto.createHash("sha256").update(paramsToSign).digest("hex");
-
-  const form = new FormData();
-  form.append("public_id", publicId);
-  form.append("api_key", apiKey);
-  form.append("timestamp", String(timestamp));
-  form.append("signature", signature);
-
-  await fetch(`https://api.cloudinary.com/v1_1/${encodeURIComponent(cloudName)}/image/destroy`, {
-    method: "POST",
-    body: form,
-    signal,
-  }).then((response) => response.body?.cancel()).catch(() => {});
+export async function deletePageImage(bookId, pageNumber, signal) {
+  const publicId = `page-${pageNumber}.jpg`;
+  const targetPath = path.join(storageRoot(), String(bookId), publicId);
+  await fsp.unlink(targetPath).catch(() => {});
 }
 
-/**
- * Delete all page images for a book from Cloudinary (called when book is deleted).
- */
 export async function deleteAllPageImages(bookId, pageCount) {
   if (!Number.isSafeInteger(pageCount) || pageCount <= 0) return;
-  const signal = AbortSignal.timeout(30_000);
-  // Bound simultaneous remote requests for large books.
-  for (let start = 1; start <= pageCount; start += 8) {
-    if (signal.aborted) break;
-    const tasks = [];
-    for (let i = start; i <= Math.min(start + 7, pageCount); i += 1) {
-      tasks.push(deletePageImage(bookId, i, signal));
-    }
-    await Promise.allSettled(tasks);
+  for (let i = 1; i <= pageCount; i += 1) {
+    await deletePageImage(bookId, i);
   }
+  // Try to clean up the directory
+  const dirPath = path.join(storageRoot(), String(bookId));
+  await fsp.rmdir(dirPath).catch(() => {});
 }
 
-/**
- * Delete a raw file (uploaded PDF) from Cloudinary.
- * objectKey = "proofreader_assets/pdf_UUID_name" (no .pdf extension)
- */
 export async function deleteUploadObject(objectKey, pdfParts) {
   let parts;
   try {
@@ -253,33 +153,10 @@ export async function deleteUploadObject(objectKey, pdfParts) {
   } catch {
     return;
   }
-
-  const cloudName = process.env.CLOUDINARY_CLOUD_NAME;
-  const apiKey = process.env.CLOUDINARY_API_KEY;
-  const apiSecret = process.env.CLOUDINARY_API_SECRET;
-  if (!cloudName || !apiKey || !apiSecret) return;
-
-  const signal = AbortSignal.timeout(30_000);
+  const storageDir = storageRoot();
   for (let i = 0; i < parts; i++) {
-    if (signal.aborted) break;
     const partKey = parts > 1 ? `${objectKey}.part${i}` : objectKey;
-    // Cloudinary raw/destroy requires the extension to match the stored resource exactly
-    const publicId = partKey.toLowerCase().endsWith(".pdf") ? partKey : `${partKey}.pdf`;
-    const timestamp = Math.round(Date.now() / 1000);
-
-    const paramsToSign = `public_id=${publicId}&timestamp=${timestamp}${apiSecret}`;
-    const signature = crypto.createHash("sha256").update(paramsToSign).digest("hex");
-
-    const form = new FormData();
-    form.append("public_id", publicId);
-    form.append("api_key", apiKey);
-    form.append("timestamp", String(timestamp));
-    form.append("signature", signature);
-
-    await fetch(`https://api.cloudinary.com/v1_1/${encodeURIComponent(cloudName)}/raw/destroy`, {
-      method: "POST",
-      body: form,
-      signal,
-    }).then((response) => response.body?.cancel()).catch(() => {});
+    const targetPath = path.join(storageDir, partKey);
+    await fsp.unlink(targetPath).catch(() => {});
   }
 }

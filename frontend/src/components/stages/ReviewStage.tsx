@@ -715,16 +715,10 @@ export function ReviewStage({
           </button>
         </div>
 
-        {/* Tab 1: Automated Queue & Web Search */}
         {activeRightTab === "automated" && (
           <div className="flex-grow flex flex-col min-h-0">
             {/* Automated Issues Queue */}
             <div className="flex-1 overflow-y-auto min-h-0 custom-scrollbar">
-              {analysisWarnings.length > 0 && (
-                <div role="status" className="m-4 rounded-xl border border-amber-200 bg-amber-50 p-3 text-xs text-amber-800">
-                  {analysisWarnings.map((warning, index) => <p key={index}>{warning}</p>)}
-                </div>
-              )}
               <IssueList 
                 issues={issues}
                 selectedId={activeIssueId}

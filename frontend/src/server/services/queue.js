@@ -20,6 +20,7 @@ import {
   getChapterContextForAnalysis,
   getChapterForPage,
   refreshEvidenceIndex,
+  buildAllChapterContexts,
 } from "../../../feature/chapter-proofreader/index.js";
 import { uploadPageImage, deleteAllPageImages, deleteUploadObject, downloadPdfObject, tempPdfPath } from "../storage.js";
 import { HttpError } from "../validation.js";
@@ -150,13 +151,23 @@ export async function refreshBookStats(bookId) {
     bookId,
     [{ $set: {
       stats: { $literal: stats },
-      // A pause arriving after the snapshot above must still win.
-      status: { $cond: [{ $eq: ["$status", "paused"] }, "paused", status] },
+      status: {
+        $switch: {
+          branches: [
+            { case: { $in: ["$status", ["paused", "context_approval"]] }, then: "$status" },
+            { case: { $and: [
+                { $in: ["$status", ["done", "error"]] },
+                { $in: [{ $literal: status }, ["queued", "processing"]] }
+              ]}, then: "$status" }
+          ],
+          default: { $literal: status }
+        }
+      },
       progress: { $literal: {
         current: processing?.pageNumber || done,
         done,
         failed,
-        indexed:pages.filter(page=>page.evidencePrepared).length,
+        indexed: pages.filter(page=>page.evidencePrepared).length,
       } },
       error: { $cond: [{ $eq: ["$status", "paused"] }, "$error",
         status === "error" ? "Every page failed to analyze." : "$$REMOVE"] },
@@ -218,7 +229,7 @@ export function serializePage(page, { includeText = false } = {}) {
     coverage:p.coverage,
     updatedAt: p.updatedAt,
     textExtract: includeText ? p.textExtract : undefined,
-    imageUrl: `/api/books/${p.bookId}/pages/${p.pageNumber}/image`,
+    imageUrl: `${process.env.NEXT_PUBLIC_BASE_PATH || ""}/api/books/${p.bookId}/pages/${p.pageNumber}/image`,
   };
 }
 
@@ -510,6 +521,24 @@ export async function claimBatch({bookId,limit=batchSize()}={}) {
       if(bIdx>=activeBookIdsArr.length)bIdx=0;
       continue;
     }
+    
+    if (!needsEvidence && !preparing) {
+      const bookObj = await Book.findById(bId).select("chapterAnalysis status").lean();
+      if (bookObj && bookObj.status !== "context_approval" && !bookObj.chapterAnalysis?.contextApproved) {
+        // Evidence is prepared. Time to pause for context approval.
+        await Book.updateOne({_id: bId}, { $set: { status: "context_approval" } });
+        activeBookIdsArr.splice(bIdx, 1);
+        if(bIdx>=activeBookIdsArr.length)bIdx=0;
+        
+        // Trigger background build of all chapters
+        const bookDoc = await Book.findById(bId);
+        const pdfPath = await ensureLocalPdf(bookDoc);
+        buildAllChapterContexts(bookDoc, pdfPath).catch(err => console.error("Background context build failed:", err));
+        
+        continue;
+      }
+    }
+
     const updated = await Page.findOneAndUpdate(
       { bookId: bId, status: "pending",...(needsEvidence?{evidencePrepared:{$ne:true}}:{}) },
       { $set: { status: "processing", analysisRunId: crypto.randomUUID(), processingHeartbeatAt: new Date() }, $unset: { error: 1 } },

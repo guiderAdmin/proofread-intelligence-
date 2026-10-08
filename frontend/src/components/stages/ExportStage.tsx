@@ -10,6 +10,8 @@ interface ExportStageProps {
   fileSize?: string | number;
   totalAnnotations?: number;
   hasActiveFile?: boolean;
+  allWarnings?: string[];
+  totalTokens?: number;
 }
 
 export function ExportStage({
@@ -19,6 +21,8 @@ export function ExportStage({
   fileSize = "0.0 MB",
   totalAnnotations = 0,
   hasActiveFile = false,
+  allWarnings = [],
+  totalTokens = 0,
 }: ExportStageProps) {
   const [downloading, setDownloading] = useState<string | null>(null);
 
@@ -28,6 +32,9 @@ export function ExportStage({
   } else if (fileSize) {
     formattedSize = fileSize;
   }
+
+  // Filter out noisy warnings (e.g. standard hallucination suppressions)
+  const importantWarnings = allWarnings.filter(w => !w.toLowerCase().includes("candidates") && !w.toLowerCase().includes("first-pass"));
 
   const handleDownload = async (id: string) => {
     setDownloading(id);
@@ -128,16 +135,6 @@ export function ExportStage({
             
             <div className="space-y-3 pt-1">
               <div className="flex items-center gap-3.5 p-3 rounded-lg bg-slate-50 border border-slate-200">
-                <div className="w-10 h-10 rounded-lg bg-brand-50 text-brand-600 flex items-center justify-center border border-brand-200 shrink-0">
-                  <Award className="h-5 w-5" />
-                </div>
-                <div className="flex-1">
-                  <span className="text-[9px] text-slate-400 uppercase font-bold tracking-wider">Rating</span>
-                  <p className="text-xs font-bold text-slate-800 mt-0.5">Compliancy Met (Grade A)</p>
-                </div>
-              </div>
-
-              <div className="flex items-center gap-3.5 p-3 rounded-lg bg-slate-50 border border-slate-200">
                 <div className="w-10 h-10 rounded-lg bg-accent-50 text-accent-600 flex items-center justify-center border border-accent-200 shrink-0">
                   <Layers className="h-5 w-5" />
                 </div>
@@ -146,9 +143,22 @@ export function ExportStage({
                   <p className="text-xs font-bold text-slate-800 mt-0.5">{totalAnnotations} total items verified</p>
                 </div>
               </div>
-
-
             </div>
+
+            {/* Analysis Warnings Log */}
+            {importantWarnings.length > 0 && (
+              <div className="mt-4 pt-4 border-t border-slate-100">
+                <h3 className="text-[10px] font-bold uppercase tracking-widest text-amber-600 mb-2">Analysis Warnings Log</h3>
+                <div className="space-y-1 max-h-32 overflow-y-auto custom-scrollbar p-2 bg-amber-50/50 border border-amber-100 rounded-lg text-[10px] text-amber-800 font-medium">
+                  {importantWarnings.map((warning, i) => (
+                    <div key={i} className="flex gap-1.5 pb-1">
+                      <span className="text-amber-400 shrink-0">•</span>
+                      <span>{warning}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
           </div>
 
           <div className="pt-6 border-t border-slate-100 text-center mt-6">
@@ -160,7 +170,6 @@ export function ExportStage({
               <ArrowRight className="h-4 w-4" />
             </button>
           </div>
-
         </div>
       </div>
     </div>

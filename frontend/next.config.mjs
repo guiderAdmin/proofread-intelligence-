@@ -2,6 +2,7 @@ import nextConstants from "next/constants.js";
 
 /** @type {import('next').NextConfig} */
 const nextConfig = {
+  basePath: process.env.NEXT_PUBLIC_BASE_PATH || "",
   // Development and production must never overwrite each other's webpack
   // manifests while a local dev server is running.
   distDir: '.next',

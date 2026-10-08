@@ -20,6 +20,7 @@ const ReviewStage = dynamic(
 
 import { ExportStage } from "./stages/ExportStage";
 import { SettingsView } from "./system/SettingsView";
+import { ChapterMemoryEditor } from "./feature/ChapterMemoryEditor";
 
 const AppSidebar = dynamic(
   () => import("./system/AppSidebar").then((mod) => mod.AppSidebar),
@@ -36,14 +37,14 @@ interface SavedBook {
   title: string;
   originalName?: string;
   pageCount: number;
-  status: "queued" | "processing" | "paused" | "done" | "error";
+  status: "queued" | "context_approval" | "processing" | "paused" | "done" | "error";
   progress?: { done?: number; failed?: number };
   stats?: { issues?: number };
   createdAt?: string;
 }
 
 async function persistMarksSnapshot({ jobId, marks }: { jobId: string; marks: CustomMark[] }) {
-  const response = await fetch(`/api/books/${encodeURIComponent(jobId)}`, {
+  const response = await fetch(`${process.env.NEXT_PUBLIC_BASE_PATH || ""}/api/books/${encodeURIComponent(jobId)}`, {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ customMarks: marks }),
@@ -128,7 +129,7 @@ export default function ProofreaderFlow() {
   const [activeJobId, setActiveJobId] = useState<string | null>(() => {
     return readSession("pf_jobId");
   });
-  const [analysisStatus, setAnalysisStatus] = useState<"queued" | "processing" | "paused" | "done" | "error">("queued");
+  const [analysisStatus, setAnalysisStatus] = useState<"queued" | "context_approval" | "processing" | "paused" | "done" | "error">("queued");
   const [uploadPhase, setUploadPhase] = useState<{ active: boolean; percent: number }>({ active: false, percent: 0 });
   const [progress, setProgress] = useState(0);
   const [totalPages, setTotalPages] = useState(0);
@@ -139,6 +140,16 @@ export default function ProofreaderFlow() {
   const [issues, setIssues] = useState<ProofreaderIssue[]>([]);
   const latestIssuesRef = useRef(issues);
   latestIssuesRef.current = issues;
+  const [isMemoryEditorOpen, setIsMemoryEditorOpen] = useState(false);
+  const prevStatusRef = useRef(analysisStatus);
+  
+  useEffect(() => {
+    if (analysisStatus === "context_approval" && prevStatusRef.current !== "context_approval") {
+      setIsMemoryEditorOpen(true);
+    }
+    prevStatusRef.current = analysisStatus;
+  }, [analysisStatus]);
+  
   const [pages, setPages] = useState<ProofreaderPageData[]>([]);
   const [customMarks, setCustomMarks] = useState<CustomMark[]>([]);
   const [currentPage, setCurrentPage] = useState<number>(() => {
@@ -170,7 +181,7 @@ export default function ProofreaderFlow() {
       if(workerRequestRef.current) {timer=setTimeout(work,2000);return;}
       const request=(async()=>{
         try {
-          const response=await fetch("/api/worker",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({bookId:activeJobId})});
+          const response=await fetch((process.env.NEXT_PUBLIC_BASE_PATH || "") + "/api/worker",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({bookId:activeJobId})});
           if(!response.ok && !cancelled) {
             const payload=await response.json().catch(()=>({}));setGlobalError(payload.error||"Analysis worker is temporarily unavailable; saved findings are preserved.");
           }
@@ -307,7 +318,7 @@ export default function ProofreaderFlow() {
     if (!snapshot) return;
     const jobId = snapshot.jobId;
     const body = JSON.stringify({ customMarks: snapshot.marks });
-    fetch(`/api/books/${encodeURIComponent(jobId)}`, {
+    fetch(`${process.env.NEXT_PUBLIC_BASE_PATH || ""}/api/books/${encodeURIComponent(jobId)}`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body,
@@ -376,7 +387,7 @@ export default function ProofreaderFlow() {
 
   const refreshSavedBooks = async () => {
     try {
-      const response = await fetch("/api/books", { cache: "no-store" });
+      const response = await fetch((process.env.NEXT_PUBLIC_BASE_PATH || "") + "/api/books", { cache: "no-store" });
       const payload = await response.json();
       if (!response.ok) throw new Error(payload?.error || "Could not load saved proofreads");
       setSavedBooks(Array.isArray(payload) ? payload : []);
@@ -490,6 +501,7 @@ export default function ProofreaderFlow() {
       severityCounts,
       issues: normalized,
       perPage: backendPages,
+      model: book.analysisModel || "gemini-3.6-flash",
     };
   };
 
@@ -507,7 +519,7 @@ export default function ProofreaderFlow() {
       pollInFlightRef.current = true;
       try {
         const fetchedReviewVersion = reviewVersionRef.current;
-        const response = await fetch(`/api/job?id=${encodeURIComponent(saved.id)}`, { cache: "no-store" });
+        const response = await fetch(`${process.env.NEXT_PUBLIC_BASE_PATH || ""}/api/job?id=${encodeURIComponent(saved.id)}`, { cache: "no-store" });
         let live: any = {};
         try {
           live = await response.json();
@@ -574,7 +586,7 @@ export default function ProofreaderFlow() {
       await flushMarksSave();
       if (version !== viewVersionRef.current) return;
       const fetchedReviewVersion = reviewVersionRef.current;
-      const jobResponse = await fetch(`/api/books/${encodeURIComponent(saved.id)}`, { cache: "no-store" });
+      const jobResponse = await fetch(`${process.env.NEXT_PUBLIC_BASE_PATH || ""}/api/books/${encodeURIComponent(saved.id)}`, { cache: "no-store" });
       const payload = await jobResponse.json();
       if (version !== viewVersionRef.current) return;
       if (!jobResponse.ok) throw new Error(payload?.error || "Could not open this proofread");
@@ -611,7 +623,7 @@ export default function ProofreaderFlow() {
       setIsRefiningIssues(true);
       void (async () => {
         try {
-          const fileResponse = await fetch(`/api/books/${encodeURIComponent(saved.id)}/file`, { cache: "no-store" });
+          const fileResponse = await fetch(`${process.env.NEXT_PUBLIC_BASE_PATH || ""}/api/books/${encodeURIComponent(saved.id)}/file`, { cache: "no-store" });
           if (!fileResponse.ok) throw new Error("Could not load the PDF for review");
           const blob = await fileResponse.blob();
           if (version !== viewVersionRef.current) return;
@@ -650,7 +662,7 @@ export default function ProofreaderFlow() {
 
   const deleteSavedBook = async (bookId: string) => {
     try {
-      const res = await fetch(`/api/books/${encodeURIComponent(bookId)}`, { method: "DELETE" });
+      const res = await fetch(`${process.env.NEXT_PUBLIC_BASE_PATH || ""}/api/books/${encodeURIComponent(bookId)}`, { method: "DELETE" });
       if (!res.ok) {
         const payload = await res.json().catch(() => ({}));
         throw new Error(payload?.error || "Could not delete this proofread");
@@ -731,7 +743,7 @@ export default function ProofreaderFlow() {
         const chunk = file.slice(start, end);
         
         // Get upload ticket for this specific part
-        const urlRes = await fetch("/api/upload-url", {
+        const urlRes = await fetch((process.env.NEXT_PUBLIC_BASE_PATH || "") + "/api/upload-url", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -778,7 +790,7 @@ export default function ProofreaderFlow() {
       setUploadPhase({ active: false, percent: 100 });
       setProgress(0);
 
-      const res = await fetch("/api/analyze", {
+      const res = await fetch((process.env.NEXT_PUBLIC_BASE_PATH || "") + "/api/analyze", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -815,7 +827,7 @@ export default function ProofreaderFlow() {
         pollInFlightRef.current = true;
         try {
         const fetchedReviewVersion = reviewVersionRef.current;
-        const statusRes = await fetch(`/api/job?id=${encodeURIComponent(jobId)}`, { cache: "no-store" });
+        const statusRes = await fetch(`${process.env.NEXT_PUBLIC_BASE_PATH || ""}/api/job?id=${encodeURIComponent(jobId)}`, { cache: "no-store" });
         let payload: any = {};
         try {
           payload = await statusRes.json();
@@ -903,7 +915,7 @@ export default function ProofreaderFlow() {
         setStage("upload");
       }
       if (pdfFilename && !createdJob) {
-        fetch("/api/delete-file", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ objectKey: pdfFilename, totalParts: uploadPartsRef.current }) }).catch(() => {});
+        fetch((process.env.NEXT_PUBLIC_BASE_PATH || "") + "/api/delete-file", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ objectKey: pdfFilename, totalParts: uploadPartsRef.current }) }).catch(() => {});
       }
       setGlobalError(err?.message || "Analysis could not be started");
     }
@@ -1434,7 +1446,7 @@ export default function ProofreaderFlow() {
     setAnalysisStatus(action === "pause" ? "paused" : "queued");
     
     try {
-      const response = await fetch(`/api/books/${encodeURIComponent(jobId)}/${action}`, { method: "POST" });
+      const response = await fetch(`${process.env.NEXT_PUBLIC_BASE_PATH || ""}/api/books/${encodeURIComponent(jobId)}/${action}`, { method: "POST" });
       let payload: any = {};
       try {
         payload = await response.json();
@@ -1473,8 +1485,7 @@ export default function ProofreaderFlow() {
     pendingStatusRef.current.set(issue.backendUid, status);
     reviewVersionRef.current++;
     try {
-      const response = await fetch(
-      `/api/books/${encodeURIComponent(activeJobId)}/pages/${issue.page}/issues/${encodeURIComponent(issue.backendUid)}`,
+      const response = await fetch(`${process.env.NEXT_PUBLIC_BASE_PATH || ""}/api/books/${encodeURIComponent(activeJobId)}/pages/${issue.page}/issues/${encodeURIComponent(issue.backendUid)}`,
       { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ status }) }
     );
       if (!response.ok) {
@@ -1500,7 +1511,7 @@ export default function ProofreaderFlow() {
     setIsRefiningIssues(false);
     if (activeJobId && ["queued", "processing"].includes(analysisStatus)) {
       try {
-        await fetch(`/api/books/${encodeURIComponent(activeJobId)}/pause`, { method: "POST", keepalive: true });
+        await fetch(`${process.env.NEXT_PUBLIC_BASE_PATH || ""}/api/books/${encodeURIComponent(activeJobId)}/pause`, { method: "POST", keepalive: true });
       } catch (err) {
         console.warn("Failed to pause proofread:", err);
       }
@@ -1603,8 +1614,9 @@ export default function ProofreaderFlow() {
               className="flex-1 w-full mx-auto px-4 xl:px-6 py-4 flex flex-col overflow-hidden relative z-10 min-h-0 min-w-0 max-w-5xl"
             >
               {/* Premium Stepper Navigation */}
-              <div className="shrink-0 z-30 mb-4 w-full max-w-5xl mx-auto">
-                <div className="bg-white/80 backdrop-blur-sm rounded-2xl shadow-[0_4px_24px_rgba(0,0,0,0.06)] border border-slate-200/80 px-3 py-2 flex w-full relative overflow-hidden">
+              <div className="shrink-0 z-30 mb-4 w-full max-w-5xl mx-auto flex items-center justify-between gap-4">
+                <div className="flex-1 bg-white/80 backdrop-blur-sm rounded-2xl shadow-[0_4px_24px_rgba(0,0,0,0.06)] border border-slate-200/80 px-3 py-2 flex relative overflow-hidden">
+
                   {/* Animated background progress track */}
                   <div className="absolute inset-y-2 left-3 right-3 rounded-xl bg-slate-50/80 pointer-events-none" />
 
@@ -1669,6 +1681,19 @@ export default function ProofreaderFlow() {
                     );
                   })}
                 </div>
+                {activeJobId && (
+                  <button
+                    onClick={() => setIsMemoryEditorOpen(true)}
+                    className="relative flex-shrink-0 group flex items-center justify-center gap-2.5 px-6 py-2 rounded-xl transition-all duration-300 hover:bg-slate-50 active:bg-slate-100 ml-1"
+                  >
+                    <div className="relative z-10 flex items-center justify-center w-5 h-5 rounded-full text-[9px] font-black transition-all duration-300 bg-slate-200/80 text-slate-400 group-hover:bg-slate-300/60 group-hover:text-slate-600">
+                      <Database className="h-3 w-3" />
+                    </div>
+                    <span className="relative z-10 text-[12.5px] font-semibold tracking-tight whitespace-nowrap transition-all duration-300 text-slate-400 group-hover:text-slate-600">
+                      Chapter Memory
+                    </span>
+                  </button>
+                )}
               </div>
 
               {/* Dynamic Stage Body */}
@@ -1703,6 +1728,7 @@ export default function ProofreaderFlow() {
                         status={analysisStatus} onPauseToggle={toggleAnalysisPause}
                         uploadPhase={uploadPhase} indexedPages={indexedPages}
                         onCancel={resetSession} onViewReport={() => setStage(analysisStatus === "done" ? "dashboard" : "review")}
+                        onReviewContext={() => setIsMemoryEditorOpen(true)}
                       />
                     </motion.div>
                   )}
@@ -1753,6 +1779,8 @@ export default function ProofreaderFlow() {
                         onResetSession={resetSession} onExport={handleExport} fileName={selectedFile?.name}
                         fileSize={selectedFile?.size} totalAnnotations={totalCount}
                         hasActiveFile={!!selectedFile?.rawFile}
+                        allWarnings={Array.from(new Set(responseData?.perPage?.flatMap((p: any) => p.analysisWarnings || [])))}
+                        totalTokens={responseData?.perPage?.reduce((acc: number, p: any) => acc + (p.tokensUsed || 0), 0) || 0}
                       />
                     </motion.div>
                   )}
@@ -1845,6 +1873,19 @@ export default function ProofreaderFlow() {
             </div>
           </motion.div>
         </div>,
+        document.body
+      )}
+
+      {createPortal(
+        <AnimatePresence>
+          {isMemoryEditorOpen && activeJobId && (
+            <ChapterMemoryEditor
+              bookId={activeJobId}
+              onClose={() => setIsMemoryEditorOpen(false)}
+              onApprove={() => setAnalysisStatus("queued")}
+            />
+          )}
+        </AnimatePresence>,
         document.body
       )}
     </div>

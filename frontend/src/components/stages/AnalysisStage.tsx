@@ -11,11 +11,12 @@ interface AnalysisStageProps {
   fileName?: string;
   fileSize?: string;
   selectedScanTypes?: string[];
-  status?: "queued" | "processing" | "paused" | "done" | "error";
+  status?: "queued" | "context_approval" | "processing" | "paused" | "done" | "error";
   uploadPhase?: { active: boolean; percent: number };
   onPauseToggle: () => void;
   onCancel: () => void;
   onViewReport: () => void;
+  onReviewContext?: () => void;
 }
 
 interface PipelineStep {
@@ -40,6 +41,7 @@ export function AnalysisStage({
   onPauseToggle,
   onCancel,
   onViewReport,
+  onReviewContext,
 }: AnalysisStageProps) {
   const [eta, setEta] = useState<number>(30);
   const isPaused = status === "paused";
@@ -118,25 +120,7 @@ export function AnalysisStage({
         </div>
       )}
 
-      {/* Upload Phase Banner — shown while chunked upload is in progress */}
-      {uploadPhase.active && (
-        <div className="shrink-0 bg-amber-50 border border-amber-200 rounded-2xl p-4 flex items-center gap-4 animate-in fade-in duration-300">
-          <div className="w-9 h-9 rounded-xl bg-amber-100 border border-amber-200 flex items-center justify-center shrink-0">
-            <Loader2 className="h-4 w-4 text-amber-600 animate-spin" />
-          </div>
-          <div className="flex-1 min-w-0">
-            <p className="text-sm font-bold text-amber-800">Uploading to secure storage…</p>
-            <p className="text-[11px] text-amber-600 mt-0.5 font-medium">Splitting PDF into chunks and uploading. Do not close this tab.</p>
-            <div className="w-full h-1.5 bg-amber-200/60 rounded-full overflow-hidden mt-2">
-              <div
-                className="h-full bg-gradient-to-r from-amber-400 to-amber-500 transition-all duration-300 ease-out"
-                style={{ width: `${uploadPhase.percent}%` }}
-              />
-            </div>
-          </div>
-          <span className="text-sm font-black text-amber-700 font-mono shrink-0">{uploadPhase.percent}%</span>
-        </div>
-      )}
+
       
       {/* Light Header Banner */}
       <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 pb-3 border-b border-slate-200/70 shrink-0">
@@ -177,10 +161,30 @@ export function AnalysisStage({
       </div>
 
       {/* Main Analysis Dashboard Grid */}
-      <div className="grid grid-cols-1 lg:grid-cols-12 gap-5 items-stretch shrink-0">
+      <div className="grid grid-cols-1 lg:grid-cols-12 gap-5 items-stretch shrink-0 relative">
         
+        {status === "context_approval" && (
+          <div className="absolute inset-0 z-50 bg-white/60 backdrop-blur-md rounded-2xl border border-white/40 shadow-2xl flex flex-col items-center justify-center p-8 text-center animate-in fade-in duration-500">
+            <div className="w-16 h-16 bg-gradient-to-br from-brand-400 to-brand-600 rounded-2xl flex items-center justify-center shadow-lg shadow-brand-500/20 mb-6 relative">
+              <Sparkles className="h-8 w-8 text-white relative z-10" />
+              <div className="absolute inset-0 bg-brand-400 blur-xl opacity-40 animate-pulse" />
+            </div>
+            <h2 className="text-2xl font-black text-slate-900 tracking-tight mb-2">Context Ready for Approval</h2>
+            <p className="text-sm font-medium text-slate-500 max-w-md mb-8 leading-relaxed">
+              The AI has extracted and compiled the deep chapter memories for your document. Please review and approve the context so the final proofreading analysis can begin.
+            </p>
+            <button
+              onClick={onReviewContext}
+              className="px-6 py-3 bg-slate-900 hover:bg-slate-800 text-white font-bold rounded-xl flex items-center gap-2 shadow-lg transition-transform hover:scale-105 active:scale-95"
+            >
+              <Eye className="h-4 w-4" />
+              Review Chapter Context
+            </button>
+          </div>
+        )}
+
         {/* Left Column: Execution Timeline Steps */}
-        <div className="lg:col-span-7 bg-white border border-slate-200/80 p-5 rounded-2xl flex flex-col justify-between shadow-[0_4px_24px_rgba(0,0,0,0.03)] relative overflow-hidden">
+        <div className={`lg:col-span-7 bg-white border border-slate-200/80 p-5 rounded-2xl flex flex-col justify-between shadow-[0_4px_24px_rgba(0,0,0,0.03)] relative overflow-hidden ${status === "context_approval" ? "opacity-20 pointer-events-none" : ""}`}>
           <div className="flex items-center justify-between pb-3.5 border-b border-slate-100 shrink-0">
             <div className="flex items-center gap-2">
               <Terminal className="h-4 w-4 text-brand-500" />
